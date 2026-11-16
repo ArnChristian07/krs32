@@ -4,7 +4,7 @@ project(krsemulator C CXX)
 include(ExternalProject)
 include(FetchContent)
 
-# Both cores export the same retro_* functions, so neither is linked into the frontend: it opens
+# All cores export the same retro_* functions, so none is linked into the frontend: it opens
 # the one a game needs with dlopen (see CoreLibrary in krsemulator.cpp). They still have to be
 # built and packaged in the APK, which is what the rest of this file arranges.
 
@@ -88,6 +88,45 @@ if(ANDROID_ABI STREQUAL "arm64-v8a" OR ANDROID_ABI STREQUAL "x86_64")
 
   add_library(krscorepackage SHARED src/main/cpp/corepackage.c)
   target_link_libraries(krscorepackage PRIVATE melondsds_core)
+
+  # --- Azahar (Nintendo 3DS) ----------------------------------------------------------------------
+
+  # Azahar only builds with CMake 3.25+ (Gradle uses 3.22) and a recursive submodule checkout, so
+  # the official prebuilt libretro core is used instead, pinned by hash. Upstream only publishes it
+  # for arm64; elsewhere the frontend reports that 3DS games aren't supported.
+  if(ANDROID_ABI STREQUAL "arm64-v8a")
+    set(AZAHAR_VERSION "2126.2")
+    set(AZAHAR_ARCHIVE "${CMAKE_BINARY_DIR}/azahar-libretro-${AZAHAR_VERSION}.zip")
+    set(AZAHAR_CORE_FILE "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/libazahar_libretro.so")
+    if(NOT EXISTS "${AZAHAR_ARCHIVE}")
+      file(DOWNLOAD
+        "https://github.com/azahar-emu/azahar/releases/download/${AZAHAR_VERSION}/azahar-libretro-android-arm64-v8a-${AZAHAR_VERSION}.zip"
+        "${AZAHAR_ARCHIVE}.part"
+        EXPECTED_HASH SHA256=1998ccf0a1f803cd66ff90a36280c64d3ff915b48acf1c4b5b0e8fd2b263faf3
+        TLS_VERIFY ON)
+      file(RENAME "${AZAHAR_ARCHIVE}.part" "${AZAHAR_ARCHIVE}")
+    endif()
+    set(AZAHAR_EXTRACTED "${CMAKE_BINARY_DIR}/azahar/azahar_libretro.so")
+    if(NOT EXISTS "${AZAHAR_EXTRACTED}")
+      file(ARCHIVE_EXTRACT INPUT "${AZAHAR_ARCHIVE}" DESTINATION "${CMAKE_BINARY_DIR}/azahar")
+    endif()
+
+    # The library output folder is emptied between configuring and building, so the core is
+    # copied in as a build step. Android only installs libraries named lib*.so.
+    add_custom_command(
+      OUTPUT "${AZAHAR_CORE_FILE}"
+      COMMAND ${CMAKE_COMMAND} -E copy "${AZAHAR_EXTRACTED}" "${AZAHAR_CORE_FILE}"
+      DEPENDS "${AZAHAR_EXTRACTED}")
+    add_custom_target(azahar DEPENDS "${AZAHAR_CORE_FILE}")
+
+    add_library(azahar_core SHARED IMPORTED)
+    set_target_properties(azahar_core PROPERTIES
+      IMPORTED_LOCATION "${AZAHAR_CORE_FILE}"
+      IMPORTED_NO_SONAME TRUE)
+    add_dependencies(azahar_core azahar)
+    target_link_libraries(krscorepackage PRIVATE azahar_core)
+    add_dependencies(krscorepackage azahar)
+  endif()
   target_link_options(krscorepackage PRIVATE "-Wl,-z,max-page-size=16384")
   add_dependencies(krscorepackage melondsds)
 endif()
@@ -98,7 +137,7 @@ find_package(oboe REQUIRED CONFIG)
 
 add_library(krsemulator SHARED src/main/cpp/krsemulator.cpp)
 target_include_directories(krsemulator PRIVATE "${mgba_SOURCE_DIR}/src/platform/libretro")
-target_link_libraries(krsemulator PRIVATE oboe::oboe android EGL GLESv2 log dl)
+target_link_libraries(krsemulator PRIVATE oboe::oboe android EGL GLESv3 log dl)
 target_link_options(krsemulator PRIVATE "-Wl,-z,max-page-size=16384")
 # The cores are opened at run time, but they still have to be built alongside the frontend.
 add_dependencies(krsemulator mgba_libretro)

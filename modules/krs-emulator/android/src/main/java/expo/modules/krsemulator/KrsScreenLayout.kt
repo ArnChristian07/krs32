@@ -6,11 +6,9 @@ import org.json.JSONObject
 import kotlin.math.min
 import kotlin.math.roundToInt
 
-// Each DS screen is 256x192.
-private const val SCREEN_ASPECT = 256f / 192f
-// In Focus, the small screen's width as a share of the large one's.
+// In Focus, the small screen's height as a share of the large one's.
 private const val FOCUS_SMALL_SHARE = 0.4f
-// In Pop-up, the popped-up screen's width as a share of the one it covers.
+// In Pop-up, the popped-up screen's height as a share of the one it covers.
 private const val POPUP_SHARE = 0.78f
 private const val MAX_GAP_DP = 64f
 
@@ -72,69 +70,86 @@ internal data class DsScreens(
 private fun rect(left: Float, top: Float, width: Float, height: Float) =
   Rect(left.roundToInt(), top.roundToInt(), (left + width).roundToInt(), (top + height).roundToInt())
 
+/** Width over height of each of a system's two screens. */
+internal data class ScreenAspects(val top: Float, val touch: Float) {
+  companion object {
+    // Each DS screen is 256x192.
+    val DS = ScreenAspects(256f / 192f, 256f / 192f)
+    // The 3DS's top screen is 400x240 and its touchscreen 320x240.
+    val N3DS = ScreenAspects(400f / 240f, 320f / 240f)
+
+    fun of(system: GameSystem) = if (system == GameSystem.N3DS) N3DS else DS
+  }
+}
+
 /** Fits the two screens into [box], in pixels, for the layout. [popupShown] is for Pop-up. */
 internal fun arrangeDsScreens(
   box: RectF,
   layout: DsScreenLayout,
   density: Float,
   popupShown: Boolean = false,
+  aspects: ScreenAspects = ScreenAspects.DS,
 ): DsScreens {
   val boxWidth = box.width()
   val boxHeight = box.height()
   val gap =
     if (layout.mode == ScreenMode.SINGLE || layout.mode == ScreenMode.POPUP) 0f else layout.gapDp * density
+  // The first screen is the top one unless swapped. Screens line up by height, like on the device.
+  val firstAspect = if (layout.swapped) aspects.touch else aspects.top
+  val secondAspect = if (layout.swapped) aspects.top else aspects.touch
   val first: Rect
   val second: Rect
 
   when (layout.mode) {
     ScreenMode.STACKED -> {
-      val height = min((boxHeight - gap) / 2, boxWidth / SCREEN_ASPECT)
-      val width = height * SCREEN_ASPECT
-      val left = box.left + (boxWidth - width) / 2
+      val height = min((boxHeight - gap) / 2, boxWidth / maxOf(firstAspect, secondAspect))
       val top = box.top + (boxHeight - height * 2 - gap) / 2
-      first = rect(left, top, width, height)
-      second = rect(left, top + height + gap, width, height)
+      val firstWidth = height * firstAspect
+      val secondWidth = height * secondAspect
+      first = rect(box.left + (boxWidth - firstWidth) / 2, top, firstWidth, height)
+      second = rect(box.left + (boxWidth - secondWidth) / 2, top + height + gap, secondWidth, height)
     }
     ScreenMode.SIDE_BY_SIDE -> {
-      val width = min((boxWidth - gap) / 2, boxHeight * SCREEN_ASPECT)
-      val height = width / SCREEN_ASPECT
-      val left = box.left + (boxWidth - width * 2 - gap) / 2
+      val height = min(boxHeight, (boxWidth - gap) / (firstAspect + secondAspect))
+      val left = box.left + (boxWidth - height * (firstAspect + secondAspect) - gap) / 2
       val top = box.top + (boxHeight - height) / 2
-      first = rect(left, top, width, height)
-      second = rect(left + width + gap, top, width, height)
+      first = rect(left, top, height * firstAspect, height)
+      second = rect(left + height * firstAspect + gap, top, height * secondAspect, height)
     }
     ScreenMode.FOCUS -> {
       val share = FOCUS_SMALL_SHARE
       // The small screen goes beside the large one or under it, whichever leaves the large bigger.
-      val besideWidth = min((boxWidth - gap) / (1 + share), boxHeight * SCREEN_ASPECT)
-      val underWidth = min(boxWidth, (boxHeight - gap) * SCREEN_ASPECT / (1 + share))
-      if (besideWidth >= underWidth) {
-        val width = besideWidth
-        val height = width / SCREEN_ASPECT
+      val besideHeight = min((boxWidth - gap) / (firstAspect + share * secondAspect), boxHeight)
+      val underHeight = min(boxWidth / firstAspect, (boxHeight - gap) / (1 + share))
+      if (besideHeight >= underHeight) {
+        val height = besideHeight
+        val width = height * firstAspect
         val top = box.top + (boxHeight - height) / 2
         // The large screen keeps the left edge and the small one grows into everything left, up to
         // the right edge, though never past the large one's size.
-        val smallWidth = min(boxWidth - width - gap, width)
+        val smallHeight = min((boxWidth - width - gap) / secondAspect, height)
+        val smallWidth = smallHeight * secondAspect
         first = rect(box.left, top, width, height)
         // Top-aligned: in landscape the face buttons cover the bottom corner.
-        second = rect(box.right - smallWidth, top, smallWidth, smallWidth / SCREEN_ASPECT)
+        second = rect(box.right - smallWidth, top, smallWidth, smallHeight)
       } else {
-        val width = underWidth
-        val height = width / SCREEN_ASPECT
-        val left = box.left + (boxWidth - width) / 2
-        val top = box.top + (boxHeight - height * (1 + share) - gap) / 2
-        first = rect(left, top, width, height)
-        second = rect(left + width * (1 - share) / 2, top + height + gap, width * share, height * share)
+        val height = underHeight
+        val width = height * firstAspect
+        val smallHeight = height * share
+        val smallWidth = smallHeight * secondAspect
+        val top = box.top + (boxHeight - height - smallHeight - gap) / 2
+        first = rect(box.left + (boxWidth - width) / 2, top, width, height)
+        second = rect(box.left + (boxWidth - smallWidth) / 2, top + height + gap, smallWidth, smallHeight)
       }
     }
     ScreenMode.SINGLE, ScreenMode.POPUP -> {
-      val width = min(boxWidth, boxHeight * SCREEN_ASPECT)
-      val height = width / SCREEN_ASPECT
+      val height = min(boxHeight, boxWidth / firstAspect)
+      val width = height * firstAspect
       first = rect(box.left + (boxWidth - width) / 2, box.top + (boxHeight - height) / 2, width, height)
       second = if (layout.mode == ScreenMode.POPUP && popupShown) {
         // Centered over the first, so it reads as a panel opened on top of the game.
-        val popupWidth = width * POPUP_SHARE
         val popupHeight = height * POPUP_SHARE
+        val popupWidth = min(popupHeight * secondAspect, width)
         rect(
           first.exactCenterX() - popupWidth / 2,
           first.exactCenterY() - popupHeight / 2,

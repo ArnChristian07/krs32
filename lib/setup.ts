@@ -17,6 +17,8 @@ export type AppSettings = {
   controlLayout: ControlLayout | null;
   /** The DS's own control layout; its controls and defaults differ from the GBA's. */
   dsControlLayout: ControlLayout | null;
+  /** The 3DS's, which adds ZL and ZR. */
+  n3dsControlLayout: ControlLayout | null;
   controllerMapping: ControllerMapping | null;
   video: VideoSettings;
   /** DS games hide their touch controls while a controller is connected. */
@@ -36,6 +38,7 @@ const DEFAULT_SETTINGS: AppSettings = {
   gameOrientation: 'landscape',
   controlLayout: null,
   dsControlLayout: null,
+  n3dsControlLayout: null,
   controllerMapping: null,
   video: { filter: 'original', strength: 0.4, aspect: 'native', scaling: 'fit' },
   autoHideControls: true,

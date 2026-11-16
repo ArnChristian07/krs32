@@ -78,7 +78,7 @@ function SaveStatesScreen({ game, inGame }: { game: Game; inGame: boolean }) {
   useFocusEffect(
     useCallback(() => {
       let active = true;
-      getRomSaveId(game.uri)
+      getRomSaveId(game.uri, game.system)
         .then((id) => {
           if (!active) return;
           setSaveId(id);
@@ -90,7 +90,7 @@ function SaveStatesScreen({ game, inGame }: { game: Game; inGame: boolean }) {
       return () => {
         active = false;
       };
-    }, [game.uri, refresh])
+    }, [game.uri, game.system, refresh])
   );
 
   async function attempt(action: () => Promise<void>, message: string) {

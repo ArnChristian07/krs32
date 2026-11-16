@@ -1,5 +1,6 @@
 import { File, Paths } from 'expo-file-system';
 
+import type { GameSystem } from '@/lib/systems';
 import KrsEmulator from '@/modules/krs-emulator';
 
 export const SLOT_COUNT = 8;
@@ -23,10 +24,11 @@ export function rememberRomSaveId(uri: string, saveId: string) {
   saveIds.set(uri, saveId);
 }
 
-export async function getRomSaveId(uri: string) {
+export async function getRomSaveId(uri: string, system: GameSystem) {
   const known = saveIds.get(uri);
   if (known) return known;
-  const saveId = await KrsEmulator.getSaveId(uri);
+  // 3DS ids come from part of the file, so the system decides how the ROM is read.
+  const saveId = await KrsEmulator.getSaveId(uri, system);
   saveIds.set(uri, saveId);
   return saveId;
 }

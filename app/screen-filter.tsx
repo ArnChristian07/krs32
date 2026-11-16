@@ -174,7 +174,7 @@ export default function ScreenFilterScreen() {
     if (inGame !== '1' || !game) return;
     let active = true;
     (async () => {
-      const saveId = await getRomSaveId(game.uri);
+      const saveId = await getRomSaveId(game.uri, game.system);
       await KrsEmulator.captureThumbnail(SHARP_THUMBNAIL, SHARP_SCALE);
       await KrsEmulator.captureThumbnail(SMOOTH_THUMBNAIL, 1);
       if (active) {

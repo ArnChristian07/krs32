@@ -10,12 +10,15 @@ import expo.modules.kotlin.exception.CodedException
 import expo.modules.kotlin.modules.Module
 import expo.modules.kotlin.modules.ModuleDefinition
 import java.io.File
+import java.io.FileInputStream
 import java.nio.ByteBuffer
 import java.security.MessageDigest
 
 private const val UNDO_STATE = "undo"
 private const val SCREENSHOT_SCALE = 4
 private const val SCREENSHOT_FOLDER = "KRS32"
+// 3DS games run to gigabytes, so their ids come from this much of each end and the size.
+private const val SAMPLE_BYTES = 16L * 1024 * 1024
 
 class KrsEmulatorModule : Module() {
   private var stateDir: File? = null
@@ -102,10 +105,11 @@ class KrsEmulatorModule : Module() {
 
       // Name saves after the ROM's contents so they survive the file being moved or renamed.
       val saves = File(context.filesDir, "saves").apply { mkdirs() }
-      val saveId = hashRom(uri)
+      val saveId = hashRom(uri, gameSystem)
       val saveFile = File(saves, "$saveId.sav")
       stateDir = File(context.filesDir, "states/$saveId").apply { mkdirs() }
-      // Anything else a core wants to keep, such as melonDS's DSi SD card images.
+      // Anything else a core wants to keep, such as melonDS's DSi SD card images, and the 3DS's
+      // NAND and SD card, which hold its games' saves.
       val coreSaves = File(context.filesDir, "core-saves").apply { mkdirs() }
 
       // A GBA BIOS imported during setup is stored here as gba_bios.bin (see lib/setup.ts). DS
@@ -126,13 +130,14 @@ class KrsEmulatorModule : Module() {
       }
       error?.let { throw CodedException(it) }
       installInputHook()
+      KrsInput.analogSticks = gameSystem == GameSystem.N3DS
       KrsInput.reset()
       KrsInput.gameActive = true
       mapOf("saveExists" to saveFile.exists(), "saveId" to saveId)
     }
 
-    AsyncFunction("getSaveId") { uri: String ->
-      hashRom(uri)
+    AsyncFunction("getSaveId") { uri: String, systemKey: String? ->
+      hashRom(uri, GameSystem.fromKey(systemKey))
     }
 
     Function("getControlDefaults") { systemKey: String? ->
@@ -141,6 +146,7 @@ class KrsEmulatorModule : Module() {
 
     Function("stop") {
       KrsInput.gameActive = false
+      KrsInput.analogSticks = false
       KrsInput.reset()
       KrsEmulatorNative.stop()
     }
@@ -269,8 +275,13 @@ class KrsEmulatorModule : Module() {
     }
   }
 
-  /** The SHA-256 of a ROM's contents, read in pieces so large DS ROMs don't fill memory. */
-  private fun hashRom(uri: String): String {
+  /**
+   * An id for a ROM that survives it being moved or renamed: the SHA-256 of its contents, read in
+   * pieces so large DS ROMs don't fill memory. For the 3DS, whose games are too large to read
+   * through on every start, it covers the size and the first and last [SAMPLE_BYTES] instead.
+   */
+  private fun hashRom(uri: String, system: GameSystem): String {
+    if (system == GameSystem.N3DS) sampledHash(uri)?.let { return it }
     val context = requireNotNull(appContext.reactContext)
     val digest = MessageDigest.getInstance("SHA-256")
     val stream = context.contentResolver.openInputStream(Uri.parse(uri))
@@ -284,6 +295,37 @@ class KrsEmulatorModule : Module() {
       }
     }
     return hex(digest.digest())
+  }
+
+  /** Null when the file can't be read out of order, such as a pipe. */
+  private fun sampledHash(uri: String): String? {
+    val context = requireNotNull(appContext.reactContext)
+    val file = context.contentResolver.openFileDescriptor(Uri.parse(uri), "r")
+      ?: throw CodedException("Could not open this file.")
+    return file.use {
+      FileInputStream(it.fileDescriptor).channel.use { channel ->
+        val size = runCatching { channel.size() }.getOrNull() ?: return@use null
+        val digest = MessageDigest.getInstance("SHA-256")
+        digest.update("3ds:$size:".toByteArray())
+        val buffer = ByteBuffer.allocate(1024 * 1024)
+        fun read(start: Long, length: Long) {
+          var position = start
+          val end = start + length
+          while (position < end) {
+            buffer.clear()
+            buffer.limit(minOf(buffer.capacity().toLong(), end - position).toInt())
+            val count = channel.read(buffer, position)
+            if (count <= 0) break
+            buffer.flip()
+            digest.update(buffer)
+            position += count
+          }
+        }
+        read(0, minOf(size, SAMPLE_BYTES))
+        if (size > SAMPLE_BYTES) read(maxOf(SAMPLE_BYTES, size - SAMPLE_BYTES), minOf(SAMPLE_BYTES, size - SAMPLE_BYTES))
+        hex(digest.digest())
+      }
+    }
   }
 
   private fun hex(bytes: ByteArray): String = bytes.joinToString("") { "%02x".format(it) }

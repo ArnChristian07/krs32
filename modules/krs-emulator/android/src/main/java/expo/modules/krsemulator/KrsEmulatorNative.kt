@@ -5,7 +5,12 @@ import android.view.Surface
 /** The systems the player runs. The numbers match `System` in krsemulator.cpp. */
 internal enum class GameSystem(val id: Int, val key: String) {
   GBA(0, "gba"),
-  NDS(1, "nds");
+  NDS(1, "nds"),
+  N3DS(2, "3ds");
+
+  /** A second, touch-sensitive screen below the main one. */
+  val hasTwoScreens: Boolean
+    get() = this != GBA
 
   companion object {
     fun fromKey(key: String?): GameSystem = entries.firstOrNull { it.key == key } ?: GBA
@@ -46,6 +51,10 @@ internal object KrsEmulatorNative {
   external fun getLastFrame(size: IntArray): ByteArray?
   external fun setCheats(lines: Array<String>): Boolean
   external fun setPadButtons(buttons: Int)
+  /** A controller's sticks, each axis from -1 to 1 with up and left negative. */
+  /** The on-screen Circle Pad, each axis from -1 to 1 with up and left negative. */
+  external fun setTouchStick(x: Float, y: Float)
+  external fun setPadAnalog(leftX: Float, leftY: Float, rightX: Float, rightY: Float)
   external fun setPadFastForward(enabled: Boolean)
   external fun setVideoSettings(filter: Int, strength: Float, aspect: Int, scaling: Int)
   external fun setSurface(surface: Surface?)

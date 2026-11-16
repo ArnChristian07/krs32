@@ -43,6 +43,7 @@ import {
   type ScreenLayout,
 } from '@/lib/screenLayout';
 import { type GameOrientation, loadSettings, saveSettings } from '@/lib/setup';
+import { SYSTEMS } from '@/lib/systems';
 import { applyVideoSettings } from '@/lib/video';
 import KrsEmulator, { KrsEmulatorView } from '@/modules/krs-emulator';
 
@@ -115,7 +116,7 @@ export default function PlayerRoute() {
 
 function Player({ request: { game, startState } }: { request: PlayRequest }) {
   const { id, uri, title, system } = game;
-  const isDs = system === 'nds';
+  const twoScreens = SYSTEMS[system].twoScreens;
   const { width, height } = useWindowDimensions();
   const [started, setStarted] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -319,7 +320,7 @@ function Player({ request: { game, startState } }: { request: PlayRequest }) {
       active = false;
       KrsEmulator.stop();
     };
-  }, [uri, system, isDs, startState, showToast]);
+  }, [uri, system, startState, showToast]);
 
   useEffect(() => {
     if (!started) return;
@@ -448,7 +449,7 @@ function Player({ request: { game, startState } }: { request: PlayRequest }) {
         controlLayout={JSON.stringify(controlLayout)}
         stretchVideo={stretchVideo}
         fastForwardSpeed={speed}
-        screenLayout={isDs ? JSON.stringify(screenLayout) : ''}
+        screenLayout={twoScreens ? JSON.stringify(screenLayout) : ''}
         autoHideControls={autoHideControls}
         onMenuPress={openMenu}
         onSwapScreensPress={swapScreens}
@@ -469,10 +470,10 @@ function Player({ request: { game, startState } }: { request: PlayRequest }) {
           quickSlotSavedAt={quickSlotSavedAt}
           cheatsOn={cheatsOn}
           onOpenSaveStates={() => openSubScreen('/save-states?inGame=1')}
-          onOpenCheats={() => openSubScreen('/cheats?inGame=1')}
+          onOpenCheats={SYSTEMS[system].cheats ? () => openSubScreen('/cheats?inGame=1') : undefined}
           onOpenScreenFilter={() => openSubScreen('/screen-filter?inGame=1')}
           onOpenControls={openControlEditor}
-          onOpenScreenLayout={isDs ? openScreenLayout : undefined}
+          onOpenScreenLayout={twoScreens ? openScreenLayout : undefined}
           fastForwardSpeed={speed}
           onSelectSpeed={selectSpeed}
           orientation={orientation}

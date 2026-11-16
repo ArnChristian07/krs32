@@ -93,7 +93,7 @@ class KrsEmulatorView(context: Context, appContext: AppContext) :
     val width = right - left
     val height = bottom - top
     layoutChild(controls, 0, 0, width, height)
-    if (system == GameSystem.NDS) {
+    if (system.hasTwoScreens) {
       layoutDsScreens(width, height)
     } else {
       screenRects = null
@@ -106,7 +106,13 @@ class KrsEmulatorView(context: Context, appContext: AppContext) :
   // The surface covers both screens; the renderer draws each into its own part of it.
   private fun layoutDsScreens(width: Int, height: Int) {
     val box = controls.dsScreenBox(width, height)
-    val screens = arrangeDsScreens(box, dsLayout, resources.displayMetrics.density, popupShown)
+    val screens = arrangeDsScreens(
+      box,
+      dsLayout,
+      resources.displayMetrics.density,
+      popupShown,
+      ScreenAspects.of(system),
+    )
     val surface = screens.bounds
     if (surface.isEmpty) surface.set(0, 0, 1, 1)
     layoutChild(gameScreen, surface.left, surface.top, surface.right, surface.bottom)

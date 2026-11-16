@@ -24,6 +24,8 @@ private const val BIT_A = 1 shl 8
 private const val BIT_X = 1 shl 9
 private const val BIT_L = 1 shl 10
 private const val BIT_R = 1 shl 11
+private const val BIT_ZL = 1 shl 12
+private const val BIT_ZR = 1 shl 13
 
 private const val STICK_THRESHOLD = 0.5f
 private const val TRIGGER_THRESHOLD = 0.5f
@@ -50,6 +52,8 @@ private val BUTTON_BITS = mapOf(
   "Y" to BIT_Y,
   "L" to BIT_L,
   "R" to BIT_R,
+  "ZL" to BIT_ZL,
+  "ZR" to BIT_ZR,
   "START" to BIT_START,
   "SELECT" to BIT_SELECT,
 )
@@ -59,6 +63,11 @@ private val FIRE_ONCE_ACTIONS = listOf("MENU", "QUICK_SAVE", "QUICK_LOAD")
 /** Turns Bluetooth controller input into emulator buttons and shortcut actions. */
 internal object KrsInput {
   @Volatile var gameActive = false
+  /**
+   * The running game reads analog sticks (the 3DS's Circle Pad and C-stick), so the controller's
+   * sticks go to it as they are instead of standing in for the D-pad.
+   */
+  @Volatile var analogSticks = false
   var onAction: ((String) -> Unit)? = null
   var onCapture: ((List<String>) -> Unit)? = null
 
@@ -98,6 +107,7 @@ internal object KrsInput {
     activeActions.clear()
     fastForwardHeld = false
     KrsEmulatorNative.setPadButtons(0)
+    KrsEmulatorNative.setPadAnalog(0f, 0f, 0f, 0f)
     KrsEmulatorNative.setPadFastForward(false)
   }
 
@@ -131,10 +141,20 @@ internal object KrsInput {
     val y = event.getAxisValue(MotionEvent.AXIS_Y)
     val hatX = event.getAxisValue(MotionEvent.AXIS_HAT_X)
     val hatY = event.getAxisValue(MotionEvent.AXIS_HAT_Y)
-    setPressed(STICK_LEFT, x < -STICK_THRESHOLD)
-    setPressed(STICK_RIGHT, x > STICK_THRESHOLD)
-    setPressed(STICK_UP, y < -STICK_THRESHOLD)
-    setPressed(STICK_DOWN, y > STICK_THRESHOLD)
+    val sticksToGame = analogSticks && gameActive && !capturing
+    if (sticksToGame) {
+      // The core applies its own dead zone.
+      KrsEmulatorNative.setPadAnalog(
+        x,
+        y,
+        event.getAxisValue(MotionEvent.AXIS_Z),
+        event.getAxisValue(MotionEvent.AXIS_RZ),
+      )
+    }
+    setPressed(STICK_LEFT, !sticksToGame && x < -STICK_THRESHOLD)
+    setPressed(STICK_RIGHT, !sticksToGame && x > STICK_THRESHOLD)
+    setPressed(STICK_UP, !sticksToGame && y < -STICK_THRESHOLD)
+    setPressed(STICK_DOWN, !sticksToGame && y > STICK_THRESHOLD)
     // Many pads report their D-pad as a hat axis instead of as key presses.
     setPressed(NAME_LEFT, hatX < -STICK_THRESHOLD)
     setPressed(NAME_RIGHT, hatX > STICK_THRESHOLD)
@@ -187,7 +207,10 @@ internal object KrsInput {
     if (NAME_RIGHT in pressed || STICK_RIGHT in pressed) buttons = buttons or BIT_RIGHT
     KrsEmulatorNative.setPadButtons(buttons)
 
-    val holdFastForward = isBound("FAST_FORWARD")
+    // ZL and ZR default to the triggers, which fast-forward also starts on; a 3DS game gets them.
+    val fastForwardKeys = mapping["FAST_FORWARD"].orEmpty()
+    val shadowed = analogSticks && (fastForwardKeys == mapping["ZL"] || fastForwardKeys == mapping["ZR"])
+    val holdFastForward = !shadowed && isBound("FAST_FORWARD")
     if (holdFastForward != fastForwardHeld) {
       fastForwardHeld = holdFastForward
       KrsEmulatorNative.setPadFastForward(holdFastForward)

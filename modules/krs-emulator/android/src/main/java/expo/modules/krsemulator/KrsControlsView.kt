@@ -35,6 +35,9 @@ private const val A = 8
 private const val BUTTON_X = 9
 private const val L = 10
 private const val R = 11
+// The 3DS's second pair of shoulder buttons.
+private const val ZL = 12
+private const val ZR = 13
 
 // Controls with no joypad button, tracked in the same mask for their pressed look.
 private const val MENU = 20
@@ -52,6 +55,9 @@ private const val CHEVRON_DISTANCE = 63f
 private const val CHEVRON_SIZE = 6f
 private const val TOUCH_SLOP = 8f
 private const val FACE_TOUCH_MARGIN = 12f
+// The Circle Pad's knob, and how far it travels from the center, as shares of the base's radius.
+private const val STICK_KNOB_SHARE = 0.5f
+private const val STICK_TRAVEL_SHARE = 0.5f
 private const val TRACK_MARGIN = 9f
 private const val TRACK_MAX_SPREAD = 1.5f
 private const val TITLE_MAX_WIDTH = 216f
@@ -59,6 +65,8 @@ private const val STATS_INTERVAL_MS = 1000L
 private const val GBA_ASPECT = 240f / 160f
 // The DS's two 256x192 screens, stacked.
 private const val DS_ASPECT = 256f / 384f
+// The 3DS's 400x240 top screen over its 320x240 touchscreen.
+private const val N3DS_ASPECT = 400f / 480f
 // Room kept around the DS screens when a controller hides the touch controls, in design units.
 private const val PAD_MARGIN = 8f
 // How far above the menu row the controller status line sits in portrait, in design units.
@@ -80,6 +88,8 @@ private val EXTRA_BUTTON_IDS = mapOf(
   "Y" to BUTTON_Y,
   "L" to L,
   "R" to R,
+  "ZL" to ZL,
+  "ZR" to ZR,
   "START" to START,
   "SELECT" to SELECT,
   "UP" to UP,
@@ -110,7 +120,7 @@ private class ExtraButton(
 )
 
 /** Positions in design units; the view scales the whole layout to fit its size. */
-private class PlayerLayout(
+private data class PlayerLayout(
   val width: Float,
   val height: Float,
   val game: RectF,
@@ -144,6 +154,12 @@ private class PlayerLayout(
   /** Where the DS screens may go while the touch controls show. */
   val screenBox: RectF? = null,
   val titleMaxWidth: Float = TITLE_MAX_WIDTH,
+  /** The 3DS's ZL and ZR buttons; null on other systems. */
+  val shoulderZL: RectF? = null,
+  val shoulderZR: RectF? = null,
+  /** The 3DS's Circle Pad; null on other systems. */
+  val stick: PointF? = null,
+  val stickRadius: Float = 0f,
 ) {
   val isPortrait: Boolean get() = frame != null
 }
@@ -223,6 +239,10 @@ private fun PlayerLayout.withSaved(saved: JSONObject?): PlayerLayout {
     screens = screens?.placed(control("SCREENS")),
     screenBox = screenBox,
     titleMaxWidth = titleMaxWidth,
+    shoulderZL = shoulderZL?.placed(control("ZL")),
+    shoulderZR = shoulderZR?.placed(control("ZR")),
+    stick = stick?.placed(control("STICK")),
+    stickRadius = control("STICK").radius(stickRadius),
   )
 }
 
@@ -231,36 +251,12 @@ private fun RectF.shifted(dy: Float) = RectF(this).apply { offset(0f, dy) }
 /** The same layout with its menu row moved by [dy], for when the touch controls are hidden. */
 private fun PlayerLayout.withToolbarShift(dy: Float): PlayerLayout {
   if (dy == 0f) return this
-  return PlayerLayout(
-    width = width,
-    height = height,
-    game = game,
-    frame = frame,
-    shoulderL = shoulderL,
-    shoulderR = shoulderR,
-    select = select,
-    start = start,
+  return copy(
     menu = menu.shifted(dy),
     fastForward = fastForward.shifted(dy),
-    dpad = dpad,
-    buttonA = buttonA,
-    buttonB = buttonB,
-    radiusA = radiusA,
-    radiusB = radiusB,
     titleCenter = titleCenter?.let { PointF(it.x, it.y + dy) },
-    editableTop = editableTop,
-    dpadScale = dpadScale,
-    opacity = opacity,
-    extras = extras,
-    buttonX = buttonX,
-    buttonY = buttonY,
-    radiusX = radiusX,
-    radiusY = radiusY,
-    pictureAspect = pictureAspect,
     swap = swap?.shifted(dy),
     screens = screens?.shifted(dy),
-    screenBox = screenBox,
-    titleMaxWidth = titleMaxWidth,
   )
 }
 
@@ -296,6 +292,9 @@ private fun describe(layout: PlayerLayout): Map<String, Any> {
   )
   layout.buttonX?.let { controls += describe(it, layout.radiusX * 2, "X", "X", "round") }
   layout.buttonY?.let { controls += describe(it, layout.radiusY * 2, "Y", "Y", "round") }
+  layout.shoulderZL?.let { controls += describe(it, "ZL", "ZL", "rect") }
+  layout.shoulderZR?.let { controls += describe(it, "ZR", "ZR", "rect") }
+  layout.stick?.let { controls += describe(it, layout.stickRadius * 2, "STICK", "Circle Pad", "stick") }
   // The portrait menu and fast-forward buttons live in the fixed row beside the title.
   if (!layout.isPortrait) {
     controls += describe(layout.fastForward, "FF", "2×", "pill")
@@ -431,9 +430,34 @@ private val DS_LANDSCAPE = PlayerLayout(
   screenBox = RectF(0f, 0f, 917f, 412f),
 )
 
+// The DS layouts with ZL and ZR beside L and R, inside them, and the taller 3DS picture. Like the
+// real 3DS, the Circle Pad sits above a smaller D-pad; Select and Start move right to make room.
+private val N3DS_PORTRAIT = DS_PORTRAIT.copy(
+  pictureAspect = N3DS_ASPECT,
+  shoulderZL = RectF(116f, 604f, 196f, 648f),
+  shoulderZR = RectF(216f, 604f, 296f, 648f),
+  stick = PointF(92f, 716f),
+  stickRadius = 54f,
+  dpad = PointF(92f, 832f),
+  dpadScale = 0.6f,
+  select = RectF(168f, 852f, 248f, 888f),
+  start = RectF(258f, 852f, 338f, 888f),
+)
+
+private val N3DS_LANDSCAPE = DS_LANDSCAPE.copy(
+  pictureAspect = N3DS_ASPECT,
+  shoulderZL = RectF(136f, 4f, 236f, 56f),
+  shoulderZR = RectF(681f, 4f, 781f, 56f),
+  stick = PointF(100f, 150f),
+  stickRadius = 56f,
+  dpad = PointF(100f, 318f),
+  dpadScale = 0.8f,
+)
+
 private fun layoutFor(system: GameSystem, portrait: Boolean) = when (system) {
   GameSystem.GBA -> if (portrait) PORTRAIT else LANDSCAPE
   GameSystem.NDS -> if (portrait) DS_PORTRAIT else DS_LANDSCAPE
+  GameSystem.N3DS -> if (portrait) N3DS_PORTRAIT else N3DS_LANDSCAPE
 }
 
 private fun layoutFor(width: Int, height: Int, system: GameSystem) =
@@ -503,10 +527,14 @@ internal class KrsControlsView(
     override fun onInputDeviceChanged(deviceId: Int) = refreshPad()
   }
 
-  /** A controller hides the DS touch controls, leaving the menu row and the touchscreen. */
-  private val padMode get() = system == GameSystem.NDS && autoHideControls && padName != null
+  /** A controller hides the DS and 3DS touch controls, leaving the menu row and the touchscreen. */
+  private val padMode get() = system.hasTwoScreens && autoHideControls && padName != null
   /** The pointer acting as the DS stylus, or -1. */
   private var stylusId = -1
+  /** The pointer holding the Circle Pad, or -1, and where it pushes it, each axis from -1 to 1. */
+  private var stickId = -1
+  private var stickX = 0f
+  private var stickY = 0f
   private var savedLayouts: JSONObject? = null
   private var scale = 1f
   private var originX = 0f
@@ -564,6 +592,9 @@ internal class KrsControlsView(
 
   init {
     contentDescription = "Game controls"
+    // Each Player gets new controls with fast-forward off; the emulator must match from the start,
+    // including while the ROM is still loading, so a toggle made then isn't lost.
+    KrsEmulatorNative.setFastForward(false)
   }
 
   private fun loadFont(family: String): Typeface =
@@ -623,6 +654,7 @@ internal class KrsControlsView(
       return
     }
     // Buttons held on controls that are about to disappear would otherwise stay down.
+    releaseStick()
     mask = 0
     extrasDown = 0
     updateTurbo()
@@ -667,6 +699,8 @@ internal class KrsControlsView(
       updateTurbo()
       sendButtons()
     }
+    // The Circle Pad may move or go away, so a thumb on it lets go.
+    releaseStick()
     // The Player hands over the saved layout for this game's system.
     val saved = savedLayouts
     scale = scaleFor(base, w, h)
@@ -718,6 +752,16 @@ internal class KrsControlsView(
     sentButtons = 0
     KrsEmulatorNative.setButtons(0)
     releaseStylus()
+    releaseStick()
+  }
+
+  private fun releaseStick() {
+    if (stickId < 0 && stickX == 0f && stickY == 0f) return
+    stickId = -1
+    stickX = 0f
+    stickY = 0f
+    KrsEmulatorNative.setTouchStick(0f, 0f)
+    invalidate()
   }
 
   private fun releaseStylus() {
@@ -733,7 +777,7 @@ internal class KrsControlsView(
   private fun isDown(id: Int) = mask and (1 shl id) != 0
 
   override fun onDraw(canvas: Canvas) {
-    if (system == GameSystem.NDS) drawDsFrame(canvas)
+    if (system.hasTwoScreens) drawDsFrame(canvas)
 
     canvas.save()
     canvas.translate(originX, originY)
@@ -756,9 +800,12 @@ internal class KrsControlsView(
 
     canvas.saveLayerAlpha(0f, 0f, layout.width, layout.height, (layout.opacity * 255).roundToInt())
     drawDpad(canvas)
+    drawStick(canvas)
     drawFaceButtons(canvas)
     drawLabelled(canvas, layout.shoulderL, 14f, "L", 20f, L)
     drawLabelled(canvas, layout.shoulderR, 14f, "R", 20f, R)
+    layout.shoulderZL?.let { drawLabelled(canvas, it, 14f, "ZL", 18f, ZL) }
+    layout.shoulderZR?.let { drawLabelled(canvas, it, 14f, "ZR", 18f, ZR) }
     drawLabelled(canvas, layout.select, 24f, "SELECT", 13f, SELECT, spaced = true)
     drawLabelled(canvas, layout.start, 24f, "START", 13f, START, spaced = true)
     if (!layout.isPortrait) drawToolbar(canvas)
@@ -997,6 +1044,30 @@ internal class KrsControlsView(
     }
   }
 
+  private fun drawStick(canvas: Canvas) {
+    val center = layout.stick ?: return
+    val radius = layout.stickRadius
+    val held = stickId >= 0
+    shape.color = TRACK
+    canvas.drawCircle(center.x, center.y, radius, shape)
+    outline.color = if (held) ACCENT else BORDER
+    outline.strokeWidth = 1f
+    canvas.drawCircle(center.x, center.y, radius, outline)
+
+    val travel = radius * STICK_TRAVEL_SHARE
+    val knobX = center.x + stickX * travel
+    val knobY = center.y + stickY * travel
+    val knob = radius * STICK_KNOB_SHARE
+    shape.color = if (held) ACCENT else FILL
+    canvas.drawCircle(knobX, knobY, knob, shape)
+    if (!held) {
+      outline.color = BORDER
+      canvas.drawCircle(knobX, knobY, knob, outline)
+    }
+    shape.color = if (held) ON_ACCENT else DOT
+    canvas.drawCircle(knobX, knobY, knob * 0.12f, shape)
+  }
+
   private fun drawArm(
     canvas: Canvas,
     id: Int,
@@ -1148,13 +1219,15 @@ internal class KrsControlsView(
     var nextExtras = 0
     val action = event.actionMasked
     if (action == MotionEvent.ACTION_DOWN || action == MotionEvent.ACTION_POINTER_DOWN) {
+      claimStick(event, event.actionIndex)
       claimStylus(event, event.actionIndex)
     }
     if (action != MotionEvent.ACTION_UP && action != MotionEvent.ACTION_CANCEL) {
       val lifted = if (action == MotionEvent.ACTION_POINTER_UP) event.actionIndex else -1
       for (index in 0 until event.pointerCount) {
-        // The stylus keeps drawing even if it slides over a button.
-        if (index == lifted || event.getPointerId(index) == stylusId) continue
+        // The stylus keeps drawing and the Circle Pad keeps steering even over a button.
+        val id = event.getPointerId(index)
+        if (index == lifted || id == stylusId || id == stickId) continue
         val x = designX(event, index)
         val y = designY(event, index)
         val extra = extraAt(x, y)
@@ -1163,7 +1236,8 @@ internal class KrsControlsView(
     }
 
     if ((action == MotionEvent.ACTION_DOWN || action == MotionEvent.ACTION_POINTER_DOWN) &&
-      event.getPointerId(event.actionIndex) != stylusId
+      event.getPointerId(event.actionIndex) != stylusId &&
+      event.getPointerId(event.actionIndex) != stickId
     ) {
       val index = event.actionIndex
       val x = designX(event, index)
@@ -1197,21 +1271,67 @@ internal class KrsControlsView(
       invalidate()
     }
     updateStylus(event)
+    updateStick(event)
     return true
+  }
+
+  /** Whether a point is on the Circle Pad, which takes it ahead of the D-pad below. */
+  private fun onStick(x: Float, y: Float): Boolean {
+    val center = layout.stick ?: return false
+    return !padMode && hypot(x - center.x, y - center.y) <= layout.stickRadius + FACE_TOUCH_MARGIN
+  }
+
+  /** Makes a new touch on the Circle Pad steer it until that finger lifts. */
+  private fun claimStick(event: MotionEvent, index: Int) {
+    if (stickId >= 0) return
+    val x = designX(event, index)
+    val y = designY(event, index)
+    if (extraAt(x, y) >= 0 || !onStick(x, y)) return
+    stickId = event.getPointerId(index)
+  }
+
+  private fun updateStick(event: MotionEvent) {
+    if (stickId < 0) return
+    val action = event.actionMasked
+    val index = event.findPointerIndex(stickId)
+    val lifted = action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL ||
+      (action == MotionEvent.ACTION_POINTER_UP && event.getPointerId(event.actionIndex) == stickId)
+    val center = layout.stick
+    if (lifted || index < 0 || center == null) {
+      releaseStick()
+      return
+    }
+    // A full push is the knob's whole travel; dragging further keeps the direction at full strength.
+    val travel = layout.stickRadius * STICK_TRAVEL_SHARE
+    var dx = (designX(event, index) - center.x) / travel
+    var dy = (designY(event, index) - center.y) / travel
+    val length = hypot(dx, dy)
+    if (length > 1f) {
+      dx /= length
+      dy /= length
+    }
+    if (dx == stickX && dy == stickY) return
+    stickX = dx
+    stickY = dy
+    KrsEmulatorNative.setTouchStick(dx, dy)
+    invalidate()
   }
 
   /** Makes a new touch the stylus if it's on the DS picture and not on a control. */
   private fun claimStylus(event: MotionEvent, index: Int) {
-    if (system != GameSystem.NDS || stylusId >= 0) return
+    if (!system.hasTwoScreens || stylusId >= 0) return
     val x = event.getX(index)
     val y = event.getY(index)
     if (!dsScreens.touch.contains(x.roundToInt(), y.roundToInt())) return
     // The top screen popped up over the touchscreen hides that part of it.
     val popup = dsScreens.popup
     if (popup != dsScreens.touch && popup.contains(x.roundToInt(), y.roundToInt())) return
+    if (event.getPointerId(index) == stickId) return
     val designX = designX(event, index)
     val designY = designY(event, index)
-    if (extraAt(designX, designY) >= 0 || hitTest(designX, designY) != 0) return
+    if (extraAt(designX, designY) >= 0 || onStick(designX, designY) || hitTest(designX, designY) != 0) {
+      return
+    }
     stylusId = event.getPointerId(index)
   }
 
@@ -1284,6 +1404,8 @@ internal class KrsControlsView(
 
   private fun hitTest(x: Float, y: Float): Int {
     if (padMode) return toolbarHit(x, y)
+    // A finger on the Circle Pad presses nothing else.
+    if (onStick(x, y)) return 0
     val dx = x - layout.dpad.x
     val dy = y - layout.dpad.y
     if (hypot(dx, dy) <= dpadTouchRadius) {
@@ -1312,6 +1434,8 @@ internal class KrsControlsView(
     return when {
       inButton(layout.shoulderL, x, y) -> 1 shl L
       inButton(layout.shoulderR, x, y) -> 1 shl R
+      layout.shoulderZL?.let { inButton(it, x, y) } == true -> 1 shl ZL
+      layout.shoulderZR?.let { inButton(it, x, y) } == true -> 1 shl ZR
       inButton(layout.select, x, y) -> 1 shl SELECT
       inButton(layout.start, x, y) -> 1 shl START
       else -> toolbarHit(x, y)

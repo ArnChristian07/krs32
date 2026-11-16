@@ -1,3 +1,4 @@
+import Check from 'lucide-react-native/icons/check';
 import Play from 'lucide-react-native/icons/play';
 import { useState } from 'react';
 import {
@@ -18,10 +19,43 @@ import { palette } from '@/constants/palette';
 import { formatClock } from '@/lib/library';
 import type { GameOrientation } from '@/lib/setup';
 
-const FAST_FORWARD_OPTIONS = [1.5, 2, 3, 4].map((speed) => ({
-  value: speed,
-  label: `${speed}×`,
-}));
+// Two rows of four: eight speeds are too many to fit one segmented row on a phone.
+const FAST_FORWARD_ROWS = [
+  [1.5, 2, 3, 4],
+  [5, 6, 8, 10],
+];
+
+function SpeedGrid({ value, onChange }: { value: number; onChange: (speed: number) => void }) {
+  return (
+    <View className="gap-1 rounded-[14px] border border-control-border p-1">
+      {FAST_FORWARD_ROWS.map((row) => (
+        <View key={row.join()} className="h-12 flex-row gap-1">
+          {row.map((speed) => {
+            const selected = speed === value;
+            return (
+              <Pressable
+                key={speed}
+                accessibilityRole="button"
+                accessibilityLabel={`${speed}×`}
+                accessibilityState={{ selected }}
+                onPress={() => onChange(speed)}
+                className={`flex-1 flex-row items-center justify-center gap-1.5 rounded-[10px] ${
+                  selected ? 'bg-foreground' : 'active:bg-control-pressed'
+                }`}>
+                {selected && <Check size={15} color={palette.background} strokeWidth={2.5} />}
+                <Text
+                  className={`font-mono text-[15px] ${selected ? 'text-background' : 'text-secondary'}`}
+                  numberOfLines={1}>
+                  {`${speed}×`}
+                </Text>
+              </Pressable>
+            );
+          })}
+        </View>
+      ))}
+    </View>
+  );
+}
 
 const ORIENTATION_OPTIONS: { value: GameOrientation; label: string }[] = [
   { value: 'landscape', label: 'Landscape' },
@@ -266,13 +300,7 @@ export function InGameMenu({
                   </Text>
                   <Text className="font-inter text-[12px] text-secondary">used by ▸▸</Text>
                 </View>
-                <SegmentedControl
-                  options={FAST_FORWARD_OPTIONS}
-                  value={fastForwardSpeed}
-                  onChange={onSelectSpeed}
-                  height={56}
-                  labelClassName="font-mono text-[15px]"
-                />
+                <SpeedGrid value={fastForwardSpeed} onChange={onSelectSpeed} />
               </View>
 
               <View className="gap-2.5">
@@ -294,7 +322,7 @@ export function InGameMenu({
                 <View className="flex-row gap-2">
                   <MenuTile
                     label="Cheats"
-                    value={onOpenCheats ? `${cheatsOn} on` : 'GBA only'}
+                    value={onOpenCheats ? `${cheatsOn} on` : 'Not available'}
                     onPress={onOpenCheats}
                   />
                   <MenuTile label="Screen filter" onPress={onOpenScreenFilter} />

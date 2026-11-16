@@ -8,6 +8,8 @@ export type MappingAction =
   | 'Y'
   | 'L'
   | 'R'
+  | 'ZL'
+  | 'ZR'
   | 'START'
   | 'SELECT'
   | 'FAST_FORWARD'
@@ -25,6 +27,9 @@ export const DEFAULT_CONTROLLER_MAPPING: ControllerMapping = {
   Y: ['BUTTON_Y'],
   L: ['BUTTON_L1'],
   R: ['BUTTON_R1'],
+  // The triggers, which fast-forward also uses; a running 3DS game takes them first.
+  ZL: ['BUTTON_L2'],
+  ZR: ['BUTTON_R2'],
   START: ['BUTTON_START'],
   SELECT: ['BUTTON_SELECT'],
   FAST_FORWARD: ['BUTTON_R2'],
@@ -33,25 +38,34 @@ export const DEFAULT_CONTROLLER_MAPPING: ControllerMapping = {
   QUICK_LOAD: [],
 };
 
-export const BUTTON_ROWS: { action: MappingAction; label: string }[] = [
+export type MappingRowInfo = {
+  action: MappingAction;
+  label: string;
+  /** Which systems use the button, when not all of them do. */
+  systems?: string;
+};
+
+export const BUTTON_ROWS: MappingRowInfo[] = [
   { action: 'A', label: 'A' },
   { action: 'B', label: 'B' },
-  { action: 'X', label: 'X (DS)' },
-  { action: 'Y', label: 'Y (DS)' },
+  { action: 'X', label: 'X', systems: 'DS · 3DS' },
+  { action: 'Y', label: 'Y', systems: 'DS · 3DS' },
   { action: 'L', label: 'L' },
   { action: 'R', label: 'R' },
+  { action: 'ZL', label: 'ZL', systems: '3DS' },
+  { action: 'ZR', label: 'ZR', systems: '3DS' },
   { action: 'START', label: 'Start' },
   { action: 'SELECT', label: 'Select' },
 ];
 
-export const SHORTCUT_ROWS: { action: MappingAction; label: string }[] = [
+export const SHORTCUT_ROWS: MappingRowInfo[] = [
   { action: 'FAST_FORWARD', label: 'Fast-forward (hold)' },
   { action: 'MENU', label: 'Open menu' },
   { action: 'QUICK_SAVE', label: 'Quick save' },
   { action: 'QUICK_LOAD', label: 'Quick load' },
 ];
 
-// Mappings saved before DS support have no X or Y, so they're filled in from the defaults.
+// Mappings saved before DS and 3DS support have no X, Y, ZL or ZR, so they're filled in from the defaults.
 export const loadControllerMapping = (): ControllerMapping => ({
   ...DEFAULT_CONTROLLER_MAPPING,
   ...loadSettings().controllerMapping,
@@ -62,11 +76,19 @@ export async function saveControllerMapping(mapping: ControllerMapping) {
   await saveSettings({ controllerMapping: mapping });
 }
 
+// ZL and ZR may share keys with fast-forward: a 3DS game gets them, other systems fast-forward.
+const SHARES_WITH_FAST_FORWARD: MappingAction[] = ['ZL', 'ZR'];
+
+const canShare = (a: MappingAction, b: MappingAction) =>
+  (a === 'FAST_FORWARD' && SHARES_WITH_FAST_FORWARD.includes(b)) ||
+  (b === 'FAST_FORWARD' && SHARES_WITH_FAST_FORWARD.includes(a));
+
 /** Binds keys to an action, clearing any other action that used exactly those keys. */
 export function assignKeys(mapping: ControllerMapping, action: MappingAction, keys: string[]) {
   const wanted = [...keys].sort().join('+');
   const next = { ...mapping };
   for (const other of Object.keys(next) as MappingAction[]) {
+    if (other === action || canShare(action, other)) continue;
     if ([...next[other]].sort().join('+') === wanted) next[other] = [];
   }
   next[action] = keys;

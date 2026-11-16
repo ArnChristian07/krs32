@@ -1,11 +1,15 @@
 #include <EGL/egl.h>
-#include <GLES2/gl2.h>
+#include <EGL/eglext.h>
+#include <GLES3/gl3.h>
 #include <android/log.h>
 #include <android/native_window.h>
 #include <android/native_window_jni.h>
+#include <dirent.h>
 #include <dlfcn.h>
+#include <fcntl.h>
 #include <jni.h>
 #include <oboe/Oboe.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -42,7 +46,22 @@ namespace {
 using Clock = std::chrono::steady_clock;
 
 // Matches the system numbers in KrsEmulatorNative.kt.
-enum class System { Gba = 0, Nds = 1 };
+enum class System { Gba = 0, Nds = 1, N3ds = 2 };
+constexpr int kSystemCount = 3;
+
+System systemFromId(jint id) {
+  switch (id) {
+    case 1:
+      return System::Nds;
+    case 2:
+      return System::N3ds;
+    default:
+      return System::Gba;
+  }
+}
+
+// Systems with a second, touch-sensitive screen below the main one.
+bool hasTwoScreens(System system) { return system == System::Nds || system == System::N3ds; }
 
 // The GBA addresses at most 32 MB of ROM; mGBA ignores anything past that, so slightly
 // oversized (padded) dumps still load. Beyond this it's surely not a GBA ROM.
@@ -88,14 +107,21 @@ struct CoreLibrary {
 };
 
 const char *coreFileName(System system) {
-  return system == System::Nds ? "libmelondsds_libretro.so" : "libmgba_libretro.so";
+  switch (system) {
+    case System::Nds:
+      return "libmelondsds_libretro.so";
+    case System::N3ds:
+      return "libazahar_libretro.so";
+    default:
+      return "libmgba_libretro.so";
+  }
 }
 
 // Opens the system's core the first time it's needed. Cores stay loaded for the life of the app,
 // so the returned pointer never dangles. Null if this device's build doesn't include the core.
 const CoreLibrary *loadCore(System system) {
   static std::mutex mutex;
-  static CoreLibrary cores[2];
+  static CoreLibrary cores[kSystemCount];
   std::lock_guard<std::mutex> lock(mutex);
   CoreLibrary &core = cores[static_cast<int>(system)];
   if (core.handle) return &core;
@@ -308,6 +334,34 @@ struct Frame {
   bool empty() const { return pixels.empty(); }
 };
 
+// A core that draws with OpenGL ES (the 3DS core) renders into a framebuffer this frontend owns
+// instead of handing over pixels. Only the emulator thread touches these.
+bool gHwRendering = false;
+retro_hw_render_callback gHwRender{};
+// The size of the latest picture the core drew into the framebuffer; zero before the first.
+int gHwFrameWidth = 0;
+int gHwFrameHeight = 0;
+// The largest picture the core said it may draw, which the framebuffer has to hold.
+unsigned gHwMaxWidth = 0;
+unsigned gHwMaxHeight = 0;
+
+// Which part of the core's picture a screen is, as fractions of it from the top left.
+struct SourceRect {
+  float left;
+  float top;
+  float right;
+  float bottom;
+};
+
+// The cores stack the two screens in one picture: the DS's are both 256x192, and the 3DS's 320x240
+// touchscreen sits centered under its 400x240 top screen (Azahar's default layout, which
+// kN3dsVariables keeps). Index 0 is the top screen and 1 the touchscreen.
+SourceRect screenSource(System system, int screen) {
+  if (screen == 0) return {0, 0, 1, 0.5f};
+  if (system == System::N3ds) return {0.1f, 0.5f, 0.9f, 1};
+  return {0, 0.5f, 1, 1};
+}
+
 GLuint compileShader(GLenum type, const char *source) {
   const GLuint shader = glCreateShader(type);
   glShaderSource(shader, 1, &source, nullptr);
@@ -318,34 +372,54 @@ GLuint compileShader(GLenum type, const char *source) {
   return shader;
 }
 
+// Owns the GL context, the window surface, and (for hardware-rendering cores) the framebuffer the
+// core draws into. The context outlives window surfaces, so a hardware-rendering core never loses
+// its GL objects when the app goes to the background or the view is rebuilt. It lives on the
+// emulator thread.
 class Renderer {
  public:
-  bool init(ANativeWindow *window) {
+  // Creates the context, current on an offscreen surface until a window arrives. [es3] is for
+  // cores that render with OpenGL ES 3.
+  bool create(bool es3) {
     display_ = eglGetDisplay(EGL_DEFAULT_DISPLAY);
     if (display_ == EGL_NO_DISPLAY || !eglInitialize(display_, nullptr, nullptr)) return false;
+    es3_ = es3;
 
-    const EGLint configAttribs[] = {EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT, EGL_SURFACE_TYPE,
-                                    EGL_WINDOW_BIT,      EGL_RED_SIZE,       5,
-                                    EGL_GREEN_SIZE,      6,                  EGL_BLUE_SIZE,
-                                    5,                   EGL_NONE};
-    EGLConfig config;
+    const EGLint renderable = es3 ? EGL_OPENGL_ES3_BIT_KHR : EGL_OPENGL_ES2_BIT;
+    const EGLint colorBits = es3 ? 8 : 5;
+    const EGLint greenBits = es3 ? 8 : 6;
+    // The offscreen surface is a pbuffer where the driver allows one alongside window surfaces,
+    // and otherwise no surface at all (EGL_KHR_surfaceless_context, which every ES 3 driver has).
+    bool pbuffer = true;
     EGLint numConfigs = 0;
-    if (!eglChooseConfig(display_, configAttribs, &config, 1, &numConfigs) || numConfigs < 1) {
+    for (const EGLint surfaceType : {EGL_WINDOW_BIT | EGL_PBUFFER_BIT, EGL_WINDOW_BIT}) {
+      const EGLint configAttribs[] = {EGL_RENDERABLE_TYPE, renderable, EGL_SURFACE_TYPE, surfaceType,
+                                      EGL_RED_SIZE,        colorBits,  EGL_GREEN_SIZE,   greenBits,
+                                      EGL_BLUE_SIZE,       colorBits,  EGL_NONE};
+      if (eglChooseConfig(display_, configAttribs, &config_, 1, &numConfigs) && numConfigs > 0) {
+        pbuffer = (surfaceType & EGL_PBUFFER_BIT) != 0;
+        break;
+      }
+    }
+    if (numConfigs < 1) {
       destroy();
       return false;
     }
 
-    const EGLint contextAttribs[] = {EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE};
-    context_ = eglCreateContext(display_, config, EGL_NO_CONTEXT, contextAttribs);
-    surface_ = eglCreateWindowSurface(display_, config, window, nullptr);
-    if (context_ == EGL_NO_CONTEXT || surface_ == EGL_NO_SURFACE ||
-        !eglMakeCurrent(display_, surface_, surface_, context_)) {
+    const EGLint contextAttribs[] = {EGL_CONTEXT_CLIENT_VERSION, es3 ? 3 : 2, EGL_NONE};
+    context_ = eglCreateContext(display_, config_, EGL_NO_CONTEXT, contextAttribs);
+    if (context_ == EGL_NO_CONTEXT) {
       destroy();
       return false;
     }
-
-    // The emulator thread sets the pace, so presenting must never block on the display.
-    eglSwapInterval(display_, 0);
+    if (pbuffer) {
+      const EGLint pbufferAttribs[] = {EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE};
+      offscreen_ = eglCreatePbufferSurface(display_, config_, pbufferAttribs);
+    }
+    if (!eglMakeCurrent(display_, offscreen_, offscreen_, context_)) {
+      destroy();
+      return false;
+    }
 
     program_ = glCreateProgram();
     glAttachShader(program_, compileShader(GL_VERTEX_SHADER, R"(
@@ -390,6 +464,8 @@ class Renderer {
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glUseProgram(0);
     textureWidth_ = 0;
     textureHeight_ = 0;
     return true;
@@ -397,39 +473,105 @@ class Renderer {
 
   void destroy() {
     if (display_ != EGL_NO_DISPLAY) {
+      if (context_ != EGL_NO_CONTEXT &&
+          eglMakeCurrent(display_, offscreen_, offscreen_, context_)) {
+        deleteFramebuffer();
+      }
       eglMakeCurrent(display_, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
-      if (surface_ != EGL_NO_SURFACE) eglDestroySurface(display_, surface_);
+      if (window_ != EGL_NO_SURFACE) eglDestroySurface(display_, window_);
+      if (offscreen_ != EGL_NO_SURFACE) eglDestroySurface(display_, offscreen_);
       if (context_ != EGL_NO_CONTEXT) eglDestroyContext(display_, context_);
       eglTerminate(display_);
     }
     display_ = EGL_NO_DISPLAY;
-    surface_ = EGL_NO_SURFACE;
+    window_ = EGL_NO_SURFACE;
+    offscreen_ = EGL_NO_SURFACE;
     context_ = EGL_NO_CONTEXT;
     program_ = 0;
     texture_ = 0;
     textureWidth_ = 0;
     textureHeight_ = 0;
+    fbo_ = 0;
+    fboTexture_ = 0;
+    fboDepth_ = 0;
+    fboWidth_ = 0;
+    fboHeight_ = 0;
   }
 
-  bool ready() const { return surface_ != EGL_NO_SURFACE; }
+  bool hasContext() const { return context_ != EGL_NO_CONTEXT; }
+  bool hasWindow() const { return window_ != EGL_NO_SURFACE; }
 
+  // Draws into [window] from now on, or offscreen when it's null. Returns false if the window
+  // couldn't be used, in which case drawing stays offscreen.
+  bool setWindow(ANativeWindow *window) {
+    if (!hasContext()) return false;
+    eglMakeCurrent(display_, offscreen_, offscreen_, context_);
+    if (window_ != EGL_NO_SURFACE) {
+      eglDestroySurface(display_, window_);
+      window_ = EGL_NO_SURFACE;
+    }
+    if (!window) return true;
+    window_ = eglCreateWindowSurface(display_, config_, window, nullptr);
+    if (window_ == EGL_NO_SURFACE || !eglMakeCurrent(display_, window_, window_, context_)) {
+      if (window_ != EGL_NO_SURFACE) eglDestroySurface(display_, window_);
+      window_ = EGL_NO_SURFACE;
+      eglMakeCurrent(display_, offscreen_, offscreen_, context_);
+      return false;
+    }
+    // The emulator thread sets the pace, so presenting must never block on the display.
+    eglSwapInterval(display_, 0);
+    return true;
+  }
+
+  // Makes sure the framebuffer a hardware-rendering core draws into holds a picture this size.
+  bool ensureFramebuffer(int width, int height, bool depth, bool stencil) {
+    if (fbo_ && width <= fboWidth_ && height <= fboHeight_) return true;
+    width = std::max(width, fboWidth_);
+    height = std::max(height, fboHeight_);
+    deleteFramebuffer();
+
+    glGenTextures(1, &fboTexture_);
+    glBindTexture(GL_TEXTURE_2D, fboTexture_);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glBindTexture(GL_TEXTURE_2D, 0);
+
+    glGenFramebuffers(1, &fbo_);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo_);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, fboTexture_, 0);
+    if (depth || stencil) {
+      glGenRenderbuffers(1, &fboDepth_);
+      glBindRenderbuffer(GL_RENDERBUFFER, fboDepth_);
+      glRenderbufferStorage(GL_RENDERBUFFER, stencil ? GL_DEPTH24_STENCIL8 : GL_DEPTH_COMPONENT24,
+                            width, height);
+      glBindRenderbuffer(GL_RENDERBUFFER, 0);
+      glFramebufferRenderbuffer(GL_FRAMEBUFFER,
+                                stencil ? GL_DEPTH_STENCIL_ATTACHMENT : GL_DEPTH_ATTACHMENT,
+                                GL_RENDERBUFFER, fboDepth_);
+    }
+    const GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    if (status != GL_FRAMEBUFFER_COMPLETE) {
+      LOGE("The core's framebuffer is incomplete (0x%x)", status);
+      deleteFramebuffer();
+      return false;
+    }
+    fboWidth_ = width;
+    fboHeight_ = height;
+    LOGI("Core framebuffer is %dx%d", width, height);
+    return true;
+  }
+
+  GLuint framebuffer() const { return fbo_; }
+
+  // Draws a frame a software-rendering core handed over.
   void draw(const Frame &frame) {
-    if (frame.empty()) return;
-    EGLint viewWidth = 0;
-    EGLint viewHeight = 0;
-    eglQuerySurface(display_, surface_, EGL_WIDTH, &viewWidth);
-    eglQuerySurface(display_, surface_, EGL_HEIGHT, &viewHeight);
-    glViewport(0, 0, viewWidth, viewHeight);
-    glClearColor(0, 0, 0, 1);
-    glClear(GL_COLOR_BUFFER_BIT);
-
-    const int filter = gVideoFilter.load();
-    const GLint sampling = filter == kFilterSmooth ? GL_LINEAR : GL_NEAREST;
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, sampling);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, sampling);
-    glUniform1i(filterUniform_, filter == kFilterLcd || filter == kFilterScanlines ? filter : 0);
-    glUniform1f(strengthUniform_, gVideoStrength.load());
-
+    if (!hasWindow() || frame.empty()) return;
+    beginDraw();
+    glBindTexture(GL_TEXTURE_2D, texture_);
     // OpenGL ES 2 can't skip row padding, so the texture spans the full pitch and the padding is
     // cropped off with texture coordinates. mGBA's 240-pixel rows are 256 pixels apart, for one.
     const bool wide = frame.format == RETRO_PIXEL_FORMAT_XRGB8888;
@@ -448,15 +590,104 @@ class Renderer {
                       frame.pixels.data());
     }
     // XRGB8888 is B, G, R, X in memory, which OpenGL ES 2 can only take as RGBA.
-    glUniform1i(swapUniform_, wide ? 1 : 0);
-    glUniform2f(textureSizeUniform_, static_cast<GLfloat>(textureWidth),
-                static_cast<GLfloat>(frame.height));
+    present(textureWidth, frame.height, frame.width, frame.height, wide, false);
+  }
 
-    const GLfloat maxU = static_cast<GLfloat>(frame.width) / textureWidth;
+  // Draws the picture a hardware-rendering core left in the framebuffer.
+  void drawHardware(int width, int height) {
+    if (!hasWindow() || !fbo_ || width <= 0 || height <= 0) return;
+    beginDraw();
+    glBindTexture(GL_TEXTURE_2D, fboTexture_);
+    // With a bottom-left origin, the core's picture is stored bottom row first.
+    present(fboWidth_, fboHeight_, std::min(width, fboWidth_), std::min(height, fboHeight_), false,
+            gHwRender.bottom_left_origin);
+  }
+
+  // Copies the hardware-rendered picture out as RGBA8888 rows from the top, for screenshots.
+  bool readHardware(int width, int height, std::vector<uint8_t> &rgba) {
+    if (!fbo_ || width <= 0 || height <= 0) return false;
+    width = std::min(width, fboWidth_);
+    height = std::min(height, fboHeight_);
+    const size_t rowBytes = static_cast<size_t>(width) * 4;
+    std::vector<uint8_t> raw(rowBytes * height);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo_);
+    if (es3_) glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+    glPixelStorei(GL_PACK_ALIGNMENT, 4);
+    glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, raw.data());
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    rgba.resize(raw.size());
+    for (int row = 0; row < height; row++) {
+      uint8_t *out = rgba.data() + rowBytes * row;
+      std::memcpy(out, raw.data() + rowBytes * (height - 1 - row), rowBytes);
+      for (size_t pixel = 3; pixel < rowBytes; pixel += 4) out[pixel] = 0xFF;
+    }
+    return true;
+  }
+
+ private:
+  // Puts the GL state this renderer relies on back in place. A hardware-rendering core shares the
+  // context and leaves its own bindings behind.
+  void beginDraw() {
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    if (es3_) {
+      glBindVertexArray(0);
+      glBindSampler(0, 0);
+      glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+      glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+      glPixelStorei(GL_UNPACK_SKIP_ROWS, 0);
+      glPixelStorei(GL_UNPACK_SKIP_PIXELS, 0);
+    }
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glDisable(GL_BLEND);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_STENCIL_TEST);
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_CULL_FACE);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glUseProgram(program_);
+    glActiveTexture(GL_TEXTURE0);
+  }
+
+  // Leaves the bindings at their defaults, which is what a core sharing the context expects.
+  void endDraw() {
+    glDisableVertexAttribArray(0);
+    glDisableVertexAttribArray(1);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glUseProgram(0);
+  }
+
+  // Draws the bound texture, whose picture is [contentWidth] by [contentHeight] at its corner, to
+  // the window. [flipped] is for a picture stored bottom row first.
+  void present(int textureWidth, int textureHeight, int contentWidth, int contentHeight,
+               bool swapRedBlue, bool flipped) {
+    EGLint viewWidth = 0;
+    EGLint viewHeight = 0;
+    eglQuerySurface(display_, window_, EGL_WIDTH, &viewWidth);
+    eglQuerySurface(display_, window_, EGL_HEIGHT, &viewHeight);
+    glViewport(0, 0, viewWidth, viewHeight);
+    glClearColor(0, 0, 0, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    const int filter = gVideoFilter.load();
+    const GLint sampling = filter == kFilterSmooth ? GL_LINEAR : GL_NEAREST;
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, sampling);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, sampling);
+    glUniform1i(filterUniform_, filter == kFilterLcd || filter == kFilterScanlines ? filter : 0);
+    glUniform1f(strengthUniform_, gVideoStrength.load());
+    glUniform1i(swapUniform_, swapRedBlue ? 1 : 0);
+    glUniform2f(textureSizeUniform_, static_cast<GLfloat>(textureWidth),
+                static_cast<GLfloat>(textureHeight));
+
+    const GLfloat maxU = static_cast<GLfloat>(contentWidth) / textureWidth;
+    const GLfloat maxV = static_cast<GLfloat>(contentHeight) / textureHeight;
+    // Texture coordinates for a part of the picture given as fractions from its top left.
+    const auto u = [&](float fraction) { return fraction * maxU; };
+    const auto v = [&](float fraction) { return (flipped ? 1 - fraction : fraction) * maxV; };
+
     ScreenRect screens[2];
     bool split = false;
     bool touchFirst = false;
-    if (gSystem == System::Nds) {
+    if (hasTwoScreens(gSystem)) {
       std::lock_guard<std::mutex> lock(gScreenRectsMutex);
       split = gScreenRectsSet;
       touchFirst = gTouchScreenFirst;
@@ -464,7 +695,7 @@ class Renderer {
       screens[1] = gScreenRects[1];
     }
     if (split) {
-      // Each half of the stacked frame goes into its own rectangle.
+      // Each screen goes into its own rectangle.
       // The later one draws on top, which is how a pop-up screen covers the other.
       for (int step = 0; step < 2; ++step) {
         const int half = touchFirst ? 1 - step : step;
@@ -473,19 +704,21 @@ class Renderer {
         glViewport(static_cast<GLint>(screen.left),
                    static_cast<GLint>(viewHeight - screen.top - screen.height),
                    static_cast<GLsizei>(screen.width), static_cast<GLsizei>(screen.height));
-        drawQuad(maxU, half * 0.5f, half * 0.5f + 0.5f);
+        const SourceRect source = screenSource(gSystem, half);
+        drawQuad(u(source.left), u(source.right), v(source.top), v(source.bottom));
       }
     } else {
-      applyPictureViewport(viewWidth, viewHeight, frame.width, frame.height);
-      drawQuad(maxU, 0, 1);
+      applyPictureViewport(viewWidth, viewHeight, contentWidth, contentHeight);
+      drawQuad(0, maxU, v(0), v(1));
     }
-    eglSwapBuffers(display_, surface_);
+    endDraw();
+    eglSwapBuffers(display_, window_);
   }
 
- private:
-  // Draws the texture's columns up to maxU and rows minV to maxV over the whole viewport.
-  static void drawQuad(GLfloat maxU, GLfloat minV, GLfloat maxV) {
-    const GLfloat vertices[] = {-1, 1, 0, minV, 1, 1, maxU, minV, -1, -1, 0, maxV, 1, -1, maxU, maxV};
+  // Draws the texture between the given coordinates over the whole viewport, top edge first.
+  static void drawQuad(GLfloat minU, GLfloat maxU, GLfloat topV, GLfloat bottomV) {
+    const GLfloat vertices[] = {-1, 1,  minU, topV,    1, 1,  maxU, topV,
+                                -1, -1, minU, bottomV, 1, -1, maxU, bottomV};
     glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), vertices);
     glEnableVertexAttribArray(0);
     glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), vertices + 2);
@@ -499,7 +732,7 @@ class Renderer {
     float width = static_cast<float>(surfaceWidth);
     float height = static_cast<float>(surfaceHeight);
     if (gVideoAspect.load() != kAspectStretch) {
-      // 4:3 imitates a TV for GBA games; it would only squash the DS's two stacked screens.
+      // 4:3 imitates a TV for GBA games; it would only squash two stacked screens.
       const float aspect = gVideoAspect.load() == kAspect4By3 && gSystem == System::Gba
                                ? 4.0f / 3.0f
                                : static_cast<float>(frameWidth) / frameHeight;
@@ -516,18 +749,37 @@ class Renderer {
                static_cast<GLsizei>(width), static_cast<GLsizei>(height));
   }
 
+  void deleteFramebuffer() {
+    if (fbo_) glDeleteFramebuffers(1, &fbo_);
+    if (fboTexture_) glDeleteTextures(1, &fboTexture_);
+    if (fboDepth_) glDeleteRenderbuffers(1, &fboDepth_);
+    fbo_ = 0;
+    fboTexture_ = 0;
+    fboDepth_ = 0;
+    fboWidth_ = 0;
+    fboHeight_ = 0;
+  }
+
   GLint filterUniform_ = -1;
   GLint strengthUniform_ = -1;
   GLint textureSizeUniform_ = -1;
   GLint swapUniform_ = -1;
   EGLDisplay display_ = EGL_NO_DISPLAY;
-  EGLSurface surface_ = EGL_NO_SURFACE;
+  EGLConfig config_ = nullptr;
+  EGLSurface window_ = EGL_NO_SURFACE;
+  EGLSurface offscreen_ = EGL_NO_SURFACE;
   EGLContext context_ = EGL_NO_CONTEXT;
+  bool es3_ = false;
   GLuint program_ = 0;
   GLuint texture_ = 0;
   int textureWidth_ = 0;
   int textureHeight_ = 0;
   bool textureWide_ = false;
+  GLuint fbo_ = 0;
+  GLuint fboTexture_ = 0;
+  GLuint fboDepth_ = 0;
+  int fboWidth_ = 0;
+  int fboHeight_ = 0;
 };
 
 Renderer gRenderer;
@@ -542,6 +794,13 @@ std::atomic<bool> gBackgrounded{false};
 std::atomic<bool> gFastForward{false};
 std::atomic<bool> gPadFastForward{false};
 std::atomic<double> gFastForwardSpeed{2.0};
+constexpr double kMinFastForwardSpeed = 1.0;
+constexpr double kMaxFastForwardSpeed = 10.0;
+// Fast-forward runs far more frames than the display can show. Drawing every one would let the
+// texture upload and buffer swap, not the core, cap the speed, which DS (whose frames already cost
+// the most) felt first. So while fast-forwarding, frames come no closer together than this.
+constexpr auto kFastForwardPresentInterval = std::chrono::milliseconds(15);
+Clock::time_point gLastPresent;
 std::atomic<double> gFrameSeconds{1.0 / 60};
 
 bool isFastForwarding() {
@@ -554,6 +813,31 @@ std::atomic<uint32_t> gPadButtons{0};
 // The touchscreen, packed so a press and its position always change together: bit 32 is set while
 // touching, and the low 32 bits hold the libretro x and y coordinates as two int16s.
 std::atomic<uint64_t> gPointer{0};
+
+// A controller's analog sticks as four int16s, from the low bits: left x, left y, right x, right y.
+std::atomic<uint64_t> gPadAnalog{0};
+
+// The on-screen Circle Pad, as two int16s from the low bits: x, then y.
+std::atomic<uint32_t> gTouchStick{0};
+
+// The 3DS core reads the game from a path, so the ROM's file descriptor is kept open while it runs
+// and served to it through the VFS under gRomPath. -1 otherwise.
+int gRomFd = -1;
+
+void closeRomFd() {
+  if (gRomFd >= 0) close(gRomFd);
+  gRomFd = -1;
+}
+
+// The last message the core showed, which explains why a game wouldn't load. Emulator thread only.
+std::string gCoreMessage;
+
+// core.log in the core save directory: the running game's core log. Null when none is open.
+std::atomic<FILE *> gCoreLogFile{nullptr};
+
+void closeCoreLog() {
+  if (FILE *file = gCoreLogFile.exchange(nullptr)) std::fclose(file);
+}
 
 std::mutex gStateMutex;
 std::condition_variable gStateChanged;
@@ -571,6 +855,15 @@ std::string gSystemDir;
 // Set when the ROM's header would make the real GBA BIOS hang, so the core boots the game directly.
 bool gSkipBios = false;
 Frame gLastFrame;
+
+// Redraws the latest picture, such as after the surface or the screen arrangement changed.
+void redraw() {
+  if (gHwRendering) {
+    gRenderer.drawHardware(gHwFrameWidth, gHwFrameHeight);
+  } else {
+    gRenderer.draw(gLastFrame);
+  }
+}
 
 std::mutex gCommandMutex;
 std::vector<std::function<void()>> gCommands;
@@ -653,10 +946,44 @@ constexpr CoreVariable kMelonDsVariables[] = {
     {"melonds_console_mode", "ds"},
 };
 
+// Azahar settings that suit this frontend. Anything not listed keeps the core's own default.
+constexpr CoreVariable kN3dsVariables[] = {
+    // On Android, "auto" picks Vulkan, which this frontend doesn't provide.
+    {"citra_graphics_api", "OpenGL"},
+    // The renderer cuts the picture into its two screens (see screenSource), so the core has to
+    // keep drawing them stacked, top screen first, at the native size.
+    {"citra_layout_option", "default"},
+    {"citra_swap_screen", "Top"},
+    {"citra_resolution_factor", "1"},
+    // Touches come from the real touchscreen, and the right stick is the C-stick, never a cursor.
+    {"citra_enable_touch_touchscreen", "enabled"},
+    {"citra_enable_mouse_touchscreen", "disabled"},
+    {"citra_enable_touch_pointer_timeout", "enabled"},
+    {"citra_analog_function", "c_stick"},
+    // There's no motion sensor interface yet.
+    {"citra_enable_motion", "disabled"},
+    // Keeps the console's NAND and SD card (and so every game's saves) in the save directory.
+    {"citra_use_libretro_save_path", "LibRetro Default"},
+    {"citra_use_disk_shader_cache", "enabled"},
+    // Speed over exactness, the same trade Azahar's own Android app makes: the JITs and GPU shaders
+    // on, high-level audio, and the cheaper shader multiply, which very few games can tell apart.
+    {"citra_use_cpu_jit", "enabled"},
+    {"citra_use_hw_shader", "enabled"},
+    {"citra_use_shader_jit", "enabled"},
+    {"citra_shaders_accurate_mul", "disabled"},
+    {"citra_audio_emulation", "hle"},
+};
+
 const char *coreVariable(const char *key) {
   if (!key) return nullptr;
   if (gSystem == System::Gba) {
     if (gSkipBios && std::strcmp(key, "mgba_skip_bios") == 0) return "ON";
+    return nullptr;
+  }
+  if (gSystem == System::N3ds) {
+    for (const auto &variable : kN3dsVariables) {
+      if (std::strcmp(key, variable.key) == 0) return variable.value;
+    }
     return nullptr;
   }
   for (const auto &variable : kMelonDsVariables) {
@@ -665,9 +992,233 @@ const char *coreVariable(const char *key) {
   return nullptr;
 }
 
+// --- File access for the 3DS core -----------------------------------------------------------------
+
+// The 3DS core opens the game itself, by path. A file picked through Android's document picker
+// can't be opened again by path (not even through /proc/self/fd, which the app may lack permission
+// for), so the core's files all go through this VFS, which hands it the descriptor already open.
+// Reads and writes go through pread and pwrite with a position per handle, so any number of handles
+// can share that descriptor.
+
+}  // namespace
+
+// libretro leaves these for the frontend to define.
+struct retro_vfs_file_handle {
+  int fd = -1;
+  int64_t position = 0;
+  std::string path;
+};
+
+struct retro_vfs_dir_handle {
+  DIR *dir = nullptr;
+  std::string path;
+  bool includeHidden = false;
+  dirent *entry = nullptr;
+};
+
+namespace {
+
+// The path the core is given for the game, which this VFS maps to gRomFd.
+std::string gRomPath;
+
+bool isRomPath(const char *path) { return gRomFd >= 0 && path && gRomPath == path; }
+
+const char *vfsGetPath(retro_vfs_file_handle *stream) {
+  return stream ? stream->path.c_str() : nullptr;
+}
+
+retro_vfs_file_handle *vfsOpen(const char *path, unsigned mode, unsigned) {
+  if (!path) return nullptr;
+  const bool write = (mode & RETRO_VFS_FILE_ACCESS_WRITE) != 0;
+  int fd;
+  if (isRomPath(path)) {
+    if (write) return nullptr;
+    fd = fcntl(gRomFd, F_DUPFD_CLOEXEC, 0);
+  } else {
+    // The same meanings as libretro's own implementation: "rb", "wb", "w+b", or "r+b" with
+    // UPDATE_EXISTING.
+    int flags = O_RDONLY;
+    if (write && (mode & RETRO_VFS_FILE_ACCESS_UPDATE_EXISTING)) {
+      flags = O_RDWR;
+    } else if (write) {
+      flags = ((mode & RETRO_VFS_FILE_ACCESS_READ) ? O_RDWR : O_WRONLY) | O_CREAT | O_TRUNC;
+    }
+    fd = open(path, flags | O_CLOEXEC, 0666);
+  }
+  if (fd < 0) return nullptr;
+  auto *stream = new retro_vfs_file_handle;
+  stream->fd = fd;
+  stream->path = path;
+  return stream;
+}
+
+int vfsClose(retro_vfs_file_handle *stream) {
+  if (!stream) return -1;
+  const int closed = close(stream->fd);
+  delete stream;
+  return closed == 0 ? 0 : -1;
+}
+
+int64_t vfsSize(retro_vfs_file_handle *stream) {
+  struct stat info {};
+  return stream && fstat(stream->fd, &info) == 0 ? static_cast<int64_t>(info.st_size) : -1;
+}
+
+int64_t vfsTell(retro_vfs_file_handle *stream) { return stream ? stream->position : -1; }
+
+int64_t vfsSeek(retro_vfs_file_handle *stream, int64_t offset, int seekPosition) {
+  if (!stream) return -1;
+  int64_t base = 0;
+  if (seekPosition == RETRO_VFS_SEEK_POSITION_CURRENT) {
+    base = stream->position;
+  } else if (seekPosition == RETRO_VFS_SEEK_POSITION_END) {
+    base = vfsSize(stream);
+    if (base < 0) return -1;
+  } else if (seekPosition != RETRO_VFS_SEEK_POSITION_START) {
+    return -1;
+  }
+  if (base + offset < 0) return -1;
+  stream->position = base + offset;
+  // The libretro docs promise the new position, but libretro's own implementation (and so
+  // RetroArch) returns 0 like fseek, and Azahar passes the result on as fseek's.
+  return 0;
+}
+
+int64_t vfsRead(retro_vfs_file_handle *stream, void *data, uint64_t length) {
+  if (!stream || !data) return -1;
+  auto *out = static_cast<uint8_t *>(data);
+  uint64_t total = 0;
+  while (total < length) {
+    const ssize_t got = pread(stream->fd, out + total, length - total, stream->position);
+    if (got < 0 && errno == EINTR) continue;
+    if (got < 0) return total > 0 ? static_cast<int64_t>(total) : -1;
+    if (got == 0) break;
+    total += static_cast<uint64_t>(got);
+    stream->position += got;
+  }
+  return static_cast<int64_t>(total);
+}
+
+int64_t vfsWrite(retro_vfs_file_handle *stream, const void *data, uint64_t length) {
+  if (!stream || !data) return -1;
+  const auto *in = static_cast<const uint8_t *>(data);
+  uint64_t total = 0;
+  while (total < length) {
+    const ssize_t put = pwrite(stream->fd, in + total, length - total, stream->position);
+    if (put < 0 && errno == EINTR) continue;
+    if (put <= 0) return total > 0 ? static_cast<int64_t>(total) : -1;
+    total += static_cast<uint64_t>(put);
+    stream->position += put;
+  }
+  return static_cast<int64_t>(total);
+}
+
+// Writes go straight to the file, so there's nothing buffered to flush.
+int vfsFlush(retro_vfs_file_handle *stream) { return stream ? 0 : -1; }
+
+int vfsRemove(const char *path) { return path && std::remove(path) == 0 ? 0 : -1; }
+
+int vfsRename(const char *oldPath, const char *newPath) {
+  return oldPath && newPath && std::rename(oldPath, newPath) == 0 ? 0 : -1;
+}
+
+int64_t vfsTruncate(retro_vfs_file_handle *stream, int64_t length) {
+  return stream && ftruncate(stream->fd, length) == 0 ? 0 : -1;
+}
+
+int vfsStat(const char *path, int32_t *size) {
+  if (!path) return 0;
+  struct stat info {};
+  const bool found = isRomPath(path) ? fstat(gRomFd, &info) == 0 : stat(path, &info) == 0;
+  if (!found) return 0;
+  // libretro's stat only has room for 32 bits; sizes come from vfsSize instead.
+  if (size) *size = static_cast<int32_t>(std::min<int64_t>(info.st_size, INT32_MAX));
+  int flags = RETRO_VFS_STAT_IS_VALID;
+  if (S_ISDIR(info.st_mode)) flags |= RETRO_VFS_STAT_IS_DIRECTORY;
+  if (S_ISCHR(info.st_mode)) flags |= RETRO_VFS_STAT_IS_CHARACTER_SPECIAL;
+  return flags;
+}
+
+int vfsMkdir(const char *path) {
+  if (!path) return -1;
+  if (mkdir(path, 0777) == 0) return 0;
+  return errno == EEXIST ? -2 : -1;
+}
+
+retro_vfs_dir_handle *vfsOpendir(const char *path, bool includeHidden) {
+  if (!path) return nullptr;
+  DIR *dir = opendir(path);
+  if (!dir) return nullptr;
+  auto *handle = new retro_vfs_dir_handle;
+  handle->dir = dir;
+  handle->path = path;
+  handle->includeHidden = includeHidden;
+  return handle;
+}
+
+bool vfsReaddir(retro_vfs_dir_handle *handle) {
+  if (!handle) return false;
+  while (dirent *entry = readdir(handle->dir)) {
+    const char *name = entry->d_name;
+    if (std::strcmp(name, ".") == 0 || std::strcmp(name, "..") == 0) continue;
+    if (!handle->includeHidden && name[0] == '.') continue;
+    handle->entry = entry;
+    return true;
+  }
+  handle->entry = nullptr;
+  return false;
+}
+
+const char *vfsDirentGetName(retro_vfs_dir_handle *handle) {
+  return handle && handle->entry ? handle->entry->d_name : nullptr;
+}
+
+bool vfsDirentIsDir(retro_vfs_dir_handle *handle) {
+  if (!handle || !handle->entry) return false;
+  if (handle->entry->d_type != DT_UNKNOWN) return handle->entry->d_type == DT_DIR;
+  struct stat info {};
+  const std::string path = handle->path + "/" + handle->entry->d_name;
+  return stat(path.c_str(), &info) == 0 && S_ISDIR(info.st_mode);
+}
+
+int vfsClosedir(retro_vfs_dir_handle *handle) {
+  if (!handle) return -1;
+  closedir(handle->dir);
+  delete handle;
+  return 0;
+}
+
+constexpr unsigned kVfsVersion = 3;
+retro_vfs_interface gVfs = {
+    vfsGetPath, vfsOpen,     vfsClose,   vfsSize,          vfsTell,       vfsSeek,
+    vfsRead,    vfsWrite,    vfsFlush,   vfsRemove,        vfsRename,     vfsTruncate,
+    vfsStat,    vfsMkdir,    vfsOpendir, vfsReaddir,       vfsDirentGetName, vfsDirentIsDir,
+    vfsClosedir,
+};
+
+// The framebuffer a hardware-rendering core draws each frame into.
+uintptr_t hwCurrentFramebuffer() { return gRenderer.framebuffer(); }
+
+// Looks up GL functions for a hardware-rendering core. eglGetProcAddress only has to know
+// extension functions, so core ES 3 functions come from the library itself.
+retro_proc_address_t hwProcAddress(const char *name) {
+  static void *gles = dlopen("libGLESv3.so", RTLD_NOW | RTLD_LOCAL);
+  void *symbol = gles ? dlsym(gles, name) : nullptr;
+  if (!symbol) symbol = reinterpret_cast<void *>(eglGetProcAddress(name));
+  return reinterpret_cast<retro_proc_address_t>(symbol);
+}
+
+// Notes the largest picture the core may draw, so the framebuffer can grow to hold it.
+void noteGeometry(const retro_game_geometry &geometry) {
+  gHwMaxWidth = std::max({gHwMaxWidth, geometry.base_width, geometry.max_width});
+  gHwMaxHeight = std::max({gHwMaxHeight, geometry.base_height, geometry.max_height});
+}
+
 void coreLog(retro_log_level level, const char *format, ...) {
-  // Debug output from melonDS is far too chatty to keep.
-  if (level == RETRO_LOG_DEBUG) return;
+  // Debug output from melonDS is far too chatty to keep. Azahar's says why a game won't load, so it
+  // goes to the log file (only).
+  const bool debug = level == RETRO_LOG_DEBUG;
+  if (debug && gSystem != System::N3ds) return;
   char message[1024];
   va_list args;
   va_start(args, format);
@@ -676,7 +1227,15 @@ void coreLog(retro_log_level level, const char *format, ...) {
   const int priority = level == RETRO_LOG_ERROR  ? ANDROID_LOG_ERROR
                        : level == RETRO_LOG_WARN ? ANDROID_LOG_WARN
                                                  : ANDROID_LOG_INFO;
-  __android_log_print(priority, "KrsCore", "%s", message);
+  if (!debug) __android_log_print(priority, "KrsCore", "%s", message);
+  // Some phones (Honor's, for one) drop app logs, so the latest game's log is also kept in a file,
+  // up to a few megabytes.
+  constexpr long kMaxLogBytes = 4 * 1024 * 1024;
+  if (FILE *file = gCoreLogFile.load(); file && std::ftell(file) < kMaxLogBytes) {
+    std::fprintf(file, "%s", message);
+    if (message[0] && message[std::strlen(message) - 1] != '\n') std::fputc('\n', file);
+    std::fflush(file);
+  }
 }
 
 bool environment(unsigned command, void *data) {
@@ -705,16 +1264,49 @@ bool environment(unsigned command, void *data) {
       return true;
     case RETRO_ENVIRONMENT_SET_MESSAGE:
       if (const auto *message = static_cast<const retro_message *>(data); message->msg) {
-        LOGI("Core message: %s", message->msg);
+        coreLog(RETRO_LOG_INFO, "Core message: %s", message->msg);
+        gCoreMessage = message->msg;
       }
       return true;
     case RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO: {
-      // The picture's size comes with each frame, so only the timing matters here.
+      // The picture's size comes with each frame, so only the timing matters here, and the
+      // largest size for a hardware-rendering core's framebuffer.
       const auto *av = static_cast<const retro_system_av_info *>(data);
       if (av->timing.fps > 0) gFrameSeconds.store(1.0 / av->timing.fps);
+      noteGeometry(av->geometry);
       return true;
     }
     case RETRO_ENVIRONMENT_SET_GEOMETRY:
+      noteGeometry(*static_cast<const retro_game_geometry *>(data));
+      return true;
+    // Only the 3DS core renders with OpenGL ES; the others were built without it.
+    case RETRO_ENVIRONMENT_SET_HW_RENDER: {
+      if (gSystem != System::N3ds) return false;
+      auto *callback = static_cast<retro_hw_render_callback *>(data);
+      const bool supported = callback->context_type == RETRO_HW_CONTEXT_OPENGLES2 ||
+                             callback->context_type == RETRO_HW_CONTEXT_OPENGLES3 ||
+                             (callback->context_type == RETRO_HW_CONTEXT_OPENGLES_VERSION &&
+                              callback->version_major <= 3);
+      if (!supported) return false;
+      callback->get_current_framebuffer = hwCurrentFramebuffer;
+      callback->get_proc_address = hwProcAddress;
+      gHwRender = *callback;
+      gHwRendering = true;
+      return true;
+    }
+    case RETRO_ENVIRONMENT_GET_VFS_INTERFACE: {
+      if (gSystem != System::N3ds) return false;
+      auto *info = static_cast<retro_vfs_interface_info *>(data);
+      if (info->required_interface_version > kVfsVersion) return false;
+      info->required_interface_version = kVfsVersion;
+      info->iface = &gVfs;
+      return true;
+    }
+    case RETRO_ENVIRONMENT_SET_HW_SHARED_CONTEXT:
+      return gSystem == System::N3ds;
+    case RETRO_ENVIRONMENT_GET_PREFERRED_HW_RENDER:
+      if (gSystem != System::N3ds) return false;
+      *static_cast<unsigned *>(data) = RETRO_HW_CONTEXT_OPENGLES3;
       return true;
     default:
       return false;
@@ -722,6 +1314,16 @@ bool environment(unsigned command, void *data) {
 }
 
 void videoRefresh(const void *data, unsigned width, unsigned height, size_t pitch) {
+  if (data == RETRO_HW_FRAME_BUFFER_VALID) {
+    if (!gHwRendering || width == 0 || height == 0) return;
+    gHwFrameWidth = static_cast<int>(width);
+    gHwFrameHeight = static_cast<int>(height);
+    const auto now = Clock::now();
+    if (isFastForwarding() && now - gLastPresent < kFastForwardPresentInterval) return;
+    gLastPresent = now;
+    gRenderer.drawHardware(gHwFrameWidth, gHwFrameHeight);
+    return;
+  }
   if (!data || width == 0 || height == 0 || pitch < width * bytesPerPixel(gPixelFormat)) return;
   const auto *pixels = static_cast<const uint8_t *>(data);
   gLastFrame.pixels.assign(pixels, pixels + pitch * height);
@@ -729,7 +1331,11 @@ void videoRefresh(const void *data, unsigned width, unsigned height, size_t pitc
   gLastFrame.height = static_cast<int>(height);
   gLastFrame.pitch = pitch;
   gLastFrame.format = gPixelFormat;
-  if (gRenderer.ready()) gRenderer.draw(gLastFrame);
+  if (!gRenderer.hasWindow()) return;
+  const auto now = Clock::now();
+  if (isFastForwarding() && now - gLastPresent < kFastForwardPresentInterval) return;
+  gLastPresent = now;
+  gRenderer.draw(gLastFrame);
 }
 
 size_t audioBatch(const int16_t *samples, size_t frames) {
@@ -748,13 +1354,27 @@ void audioSample(int16_t left, int16_t right) {
 
 void inputPoll() {}
 
+// One analog stick axis. The on-screen Circle Pad steers the left stick whenever the controller's
+// left stick is centered.
+int16_t analogAxis(unsigned index, unsigned id) {
+  const uint64_t sticks = gPadAnalog.load(std::memory_order_relaxed);
+  const auto value = static_cast<int16_t>((sticks >> ((index * 2 + id) * 16)) & 0xFFFF);
+  if (value != 0 || index != RETRO_DEVICE_INDEX_ANALOG_LEFT) return value;
+  const uint32_t touch = gTouchStick.load(std::memory_order_relaxed);
+  return static_cast<int16_t>((touch >> (id * 16)) & 0xFFFF);
+}
+
 int16_t inputState(unsigned port, unsigned device, unsigned index, unsigned id) {
   if (port != 0) return 0;
   if (device == RETRO_DEVICE_JOYPAD) {
     if (id >= 16) return 0;
-    const uint32_t held = gButtons.load(std::memory_order_relaxed) |
-                          gPadButtons.load(std::memory_order_relaxed);
+    const uint32_t held =
+        gButtons.load(std::memory_order_relaxed) | gPadButtons.load(std::memory_order_relaxed);
     return static_cast<int16_t>((held >> id) & 1);
+  }
+  if (device == RETRO_DEVICE_ANALOG) {
+    if (index > RETRO_DEVICE_INDEX_ANALOG_RIGHT || id > RETRO_DEVICE_ID_ANALOG_Y) return 0;
+    return analogAxis(index, id);
   }
   if (device == RETRO_DEVICE_POINTER && index == 0) {
     const uint64_t pointer = gPointer.load(std::memory_order_relaxed);
@@ -781,10 +1401,9 @@ int16_t inputState(unsigned port, unsigned device, unsigned index, unsigned id) 
 void applySurfaceChange() {
   std::lock_guard<std::mutex> lock(gStateMutex);
   if (!gWindowDirty) return;
-  gRenderer.destroy();
-  if (gWindow && !gRenderer.init(gWindow)) LOGE("Could not initialise the renderer");
+  if (!gRenderer.setWindow(gWindow)) LOGE("Could not draw to the new surface");
   // A new surface starts black, which would blank the picture behind the pause menu.
-  if (gRenderer.ready()) gRenderer.draw(gLastFrame);
+  redraw();
   gWindowDirty = false;
   gStateChanged.notify_all();
 }
@@ -856,8 +1475,75 @@ void waitWhilePaused() {
   gAudio.start();
 }
 
-void emulatorMain(std::vector<uint8_t> rom, std::promise<std::string> result) {
+// Tells Android how long each frame may take and how long it really took, so the CPU governor
+// clocks up for a demanding core (3DS above all) instead of letting the emulator thread sit on a
+// slow, low-clocked core and miss frames. The API arrived in Android 13, so it's looked up at run
+// time and does nothing on older versions.
+class PerformanceHint {
+ public:
+  void start(int64_t targetNanos) {
+    using GetManager = void *(*)();
+    using CreateSession = void *(*)(void *, const int32_t *, size_t, int64_t);
+    auto getManager = reinterpret_cast<GetManager>(dlsym(RTLD_DEFAULT, "APerformanceHint_getManager"));
+    auto createSession =
+        reinterpret_cast<CreateSession>(dlsym(RTLD_DEFAULT, "APerformanceHint_createSession"));
+    update_ = reinterpret_cast<UpdateTarget>(
+        dlsym(RTLD_DEFAULT, "APerformanceHint_updateTargetWorkDuration"));
+    report_ = reinterpret_cast<ReportActual>(
+        dlsym(RTLD_DEFAULT, "APerformanceHint_reportActualWorkDuration"));
+    close_ = reinterpret_cast<CloseSession>(dlsym(RTLD_DEFAULT, "APerformanceHint_closeSession"));
+    if (!getManager || !createSession || !update_ || !report_ || !close_) return;
+    void *manager = getManager();
+    if (!manager) return;
+    const int32_t tid = gettid();
+    session_ = createSession(manager, &tid, 1, targetNanos);
+    target_ = targetNanos;
+  }
+
+  void report(int64_t actualNanos, int64_t targetNanos) {
+    if (!session_) return;
+    if (targetNanos != target_) {
+      update_(session_, targetNanos);
+      target_ = targetNanos;
+    }
+    if (actualNanos > 0) report_(session_, actualNanos);
+  }
+
+  void stop() {
+    if (session_) close_(session_);
+    session_ = nullptr;
+  }
+
+ private:
+  using UpdateTarget = int (*)(void *, int64_t);
+  using ReportActual = int (*)(void *, int64_t);
+  using CloseSession = void (*)(void *);
+  void *session_ = nullptr;
+  int64_t target_ = 0;
+  UpdateTarget update_ = nullptr;
+  ReportActual report_ = nullptr;
+  CloseSession close_ = nullptr;
+};
+
+int64_t toNanos(double seconds) { return static_cast<int64_t>(seconds * 1e9); }
+
+// The core's own explanation of why the game didn't start, or [fallback].
+std::string coreMessageOr(const char *fallback) {
+  return gCoreMessage.empty() ? fallback : gCoreMessage;
+}
+
+// [rom] holds the game for cores that take it from memory; [romPath] names it for one that reads
+// it itself.
+void emulatorMain(std::vector<uint8_t> rom, std::string romPath,
+                  std::promise<std::string> result) {
   gPixelFormat = RETRO_PIXEL_FORMAT_RGB565;
+  gHwRendering = false;
+  gHwRender = {};
+  gHwFrameWidth = 0;
+  gHwFrameHeight = 0;
+  gHwMaxWidth = 0;
+  gHwMaxHeight = 0;
+  gCoreMessage.clear();
   gCore->retro_set_environment(environment);
   gCore->retro_set_video_refresh(videoRefresh);
   gCore->retro_set_audio_sample(audioSample);
@@ -868,20 +1554,71 @@ void emulatorMain(std::vector<uint8_t> rom, std::promise<std::string> result) {
   gLastFrame = Frame();
 
   retro_game_info game{};
-  game.data = rom.data();
-  game.size = rom.size();
+  if (romPath.empty()) {
+    game.data = rom.data();
+    game.size = rom.size();
+  } else {
+    game.path = romPath.c_str();
+  }
   if (!gCore->retro_load_game(&game)) {
     gCore->retro_deinit();
     gRunning.store(false);
-    result.set_value("The emulator could not load this ROM.");
+    result.set_value(coreMessageOr("The emulator could not load this ROM."));
     return;
   }
   // The core keeps its own copy, and DS ROMs can be hundreds of megabytes.
   std::vector<uint8_t>().swap(rom);
-  loadSave();
 
   retro_system_av_info av{};
   gCore->retro_get_system_av_info(&av);
+  noteGeometry(av.geometry);
+
+  // Undoes a load that got as far as the graphics.
+  const auto fail = [&result](const std::string &message, bool contextReset) {
+    if (contextReset && gHwRender.context_destroy) gHwRender.context_destroy();
+    gCore->retro_unload_game();
+    gCore->retro_deinit();
+    {
+      std::lock_guard<std::mutex> lock(gStateMutex);
+      gRenderer.destroy();
+      gWindowDirty = true;
+      gStateChanged.notify_all();
+    }
+    gRunning.store(false);
+    result.set_value(message);
+  };
+
+  // The GL context is made up front, even before there's a surface to draw to: a hardware-rendering
+  // core can't load the game without one.
+  if (!gRenderer.create(gHwRendering)) {
+    fail(gHwRendering ? "This device's graphics don't support OpenGL ES 3, which this system needs."
+                      : "Could not start the graphics.",
+         false);
+    return;
+  }
+  if (gHwRendering) {
+    // Every core should say how large its picture gets; if not, the 3DS's native size will do.
+    if (gHwMaxWidth == 0 || gHwMaxHeight == 0) {
+      gHwMaxWidth = 400;
+      gHwMaxHeight = 480;
+    }
+    if (!gRenderer.ensureFramebuffer(static_cast<int>(gHwMaxWidth),
+                                     static_cast<int>(gHwMaxHeight), gHwRender.depth,
+                                     gHwRender.stencil)) {
+      fail("Could not start the graphics.", false);
+      return;
+    }
+    // Azahar only loads the game here, now that it can make its GL objects. It reports a game that
+    // won't load (most often an encrypted one) only with a message.
+    gCoreMessage.clear();
+    if (gHwRender.context_reset) gHwRender.context_reset();
+    if (!gCoreMessage.empty()) {
+      fail(gCoreMessage, true);
+      return;
+    }
+  }
+  loadSave();
+
   gFrameSeconds.store(1.0 / av.timing.fps);
   LOGI("Core ready: %.4f fps, %.0f Hz", av.timing.fps, av.timing.sample_rate);
 
@@ -890,6 +1627,12 @@ void emulatorMain(std::vector<uint8_t> rom, std::promise<std::string> result) {
   const bool audioOpen = gAudio.open(static_cast<int>(av.timing.sample_rate));
   if (audioOpen) gAudio.start();
   result.set_value("");
+
+  // A late frame is a stutter, so the emulator thread runs ahead of the app's ordinary work, at
+  // the priority Android gives display work (THREAD_PRIORITY_DISPLAY). Failing that is harmless.
+  if (setpriority(PRIO_PROCESS, 0, -4) != 0) LOGI("Could not raise the emulator thread's priority");
+  PerformanceHint hint;
+  hint.start(toNanos(gFrameSeconds.load()));
 
   auto nextFrame = Clock::now();
   auto windowStart = nextFrame;
@@ -912,9 +1655,17 @@ void emulatorMain(std::vector<uint8_t> rom, std::promise<std::string> result) {
 
     const auto frameStart = Clock::now();
     gCore->retro_run();
+    // The core may have announced a larger picture during the frame.
+    if (gHwRendering) {
+      gRenderer.ensureFramebuffer(static_cast<int>(gHwMaxWidth), static_cast<int>(gHwMaxHeight),
+                                  gHwRender.depth, gHwRender.stencil);
+    }
     const auto frameEnd = Clock::now();
     windowCost += std::chrono::duration<double, std::milli>(frameEnd - frameStart).count();
     windowFrames++;
+    hint.report(std::chrono::duration_cast<std::chrono::nanoseconds>(frameEnd - frameStart).count(),
+                toNanos(isFastForwarding() ? gFrameSeconds.load() / gFastForwardSpeed.load()
+                                           : gFrameSeconds.load()));
 
     if (++framesSinceSaveCheck >= kSaveCheckFrames) {
       framesSinceSaveCheck = 0;
@@ -947,17 +1698,21 @@ void emulatorMain(std::vector<uint8_t> rom, std::promise<std::string> result) {
     }
   }
 
+  hint.stop();
   drainCommands();
   flushSave(true);
   gAudio.close();
+  // A hardware-rendering core frees its GL objects first, while the game (and the context) still
+  // exist.
+  if (gHwRendering && gHwRender.context_destroy) gHwRender.context_destroy();
+  gCore->retro_unload_game();
+  gCore->retro_deinit();
   {
     std::lock_guard<std::mutex> lock(gStateMutex);
     gRenderer.destroy();
     gWindowDirty = true;
     gStateChanged.notify_all();
   }
-  gCore->retro_unload_game();
-  gCore->retro_deinit();
   gRunning.store(false);
 }
 
@@ -966,6 +1721,9 @@ void stopEmulator() {
   gStateChanged.notify_all();
   if (gEmuThread.joinable()) gEmuThread.join();
   gQuit.store(false);
+  // The core is done with the game, so its file can go.
+  closeRomFd();
+  closeCoreLog();
 }
 
 // --- ROM checks -----------------------------------------------------------------------------------
@@ -974,7 +1732,16 @@ size_t maxRomSize(System system) {
   return system == System::Nds ? kMaxNdsRomSize : kMaxGbaRomSize;
 }
 
-const char *systemName(System system) { return system == System::Nds ? "DS" : "GBA"; }
+const char *systemName(System system) {
+  switch (system) {
+    case System::Nds:
+      return "DS";
+    case System::N3ds:
+      return "3DS";
+    default:
+      return "GBA";
+  }
+}
 
 // Reads the whole ROM from a file descriptor. It's read here rather than handed over from Kotlin
 // so a large DS ROM never has to fit in the Java heap. Returns an error message, or "" on success.
@@ -1024,6 +1791,38 @@ std::string validateRom(const std::vector<uint8_t> &rom, System system) {
   return "";
 }
 
+// Catches a 3DS cartridge image (NCSD) that's been cut short, such as by an interrupted copy, which
+// Azahar only reports as "Failed to load ROM metadata". Returns an error message, or "".
+std::string checkN3dsImage(int fd) {
+  constexpr off_t kHeaderOffset = 0x100;
+  constexpr uint64_t kMediaUnit = 0x200;
+  uint8_t header[0x60] = {};
+  if (pread(fd, header, sizeof(header), kHeaderOffset) != static_cast<ssize_t>(sizeof(header))) {
+    return "";
+  }
+  // Other formats (CXI, 3DSX) have no partition table to check.
+  if (std::memcmp(header, "NCSD", 4) != 0) return "";
+  struct stat info {};
+  if (fstat(fd, &info) != 0 || info.st_size <= 0) return "";
+  // The partition table starts at 0x120; partition 0, the game itself, has to be all there.
+  // (Trimmed dumps only drop padding after the last partition.)
+  const auto word = [&header](size_t at) {
+    return static_cast<uint64_t>(header[at]) | (static_cast<uint64_t>(header[at + 1]) << 8) |
+           (static_cast<uint64_t>(header[at + 2]) << 16) |
+           (static_cast<uint64_t>(header[at + 3]) << 24);
+  };
+  const uint64_t gameEnd = (word(0x20) + word(0x24)) * kMediaUnit;
+  const auto size = static_cast<uint64_t>(info.st_size);
+  if (size >= gameEnd) return "";
+  char message[200];
+  std::snprintf(message, sizeof(message),
+                "This 3DS game file is incomplete: it has %llu MB of the game's %llu MB. Copy it "
+                "to your device again.",
+                static_cast<unsigned long long>(size >> 20),
+                static_cast<unsigned long long>(gameEnd >> 20));
+  return message;
+}
+
 // Whether the real GBA BIOS would accept this header. It locks up on a bad one.
 bool gbaHeaderIsValid(const std::vector<uint8_t> &rom) {
   if (rom[0xB2] != 0x96) return false;
@@ -1041,7 +1840,7 @@ std::string toString(JNIEnv *env, jstring value) {
 }
 
 bool systemInfo(jint system, retro_system_info &info) {
-  const CoreLibrary *core = loadCore(system == 1 ? System::Nds : System::Gba);
+  const CoreLibrary *core = loadCore(systemFromId(system));
   if (!core) return false;
   core->retro_get_system_info(&info);
   return true;
@@ -1100,7 +1899,7 @@ Java_expo_modules_krsemulator_KrsEmulatorNative_validExtensions(JNIEnv *env, job
 extern "C" JNIEXPORT jint JNICALL
 Java_expo_modules_krsemulator_KrsEmulatorNative_libretroApiVersion(JNIEnv *, jobject,
                                                                    jint system) {
-  const CoreLibrary *core = loadCore(system == 1 ? System::Nds : System::Gba);
+  const CoreLibrary *core = loadCore(systemFromId(system));
   return core ? static_cast<jint>(core->retro_api_version()) : 0;
 }
 
@@ -1115,20 +1914,41 @@ extern "C" JNIEXPORT jstring JNICALL
 Java_expo_modules_krsemulator_KrsEmulatorNative_start(JNIEnv *env, jobject, jint romFd,
                                                       jint systemId, jstring savePath,
                                                       jstring saveDir, jstring systemDir) {
-  const System system = systemId == 1 ? System::Nds : System::Gba;
+  const System system = systemFromId(systemId);
   const CoreLibrary *core = loadCore(system);
   if (!core) {
-    return env->NewStringUTF(system == System::Nds
-                                 ? "DS games need a 64-bit device."
-                                 : "The emulator is missing from this build of the app.");
+    switch (system) {
+      case System::Nds:
+        return env->NewStringUTF("DS games need a 64-bit device.");
+      case System::N3ds:
+        return env->NewStringUTF("3DS games need a 64-bit ARM device.");
+      default:
+        return env->NewStringUTF("The emulator is missing from this build of the app.");
+    }
   }
 
   std::vector<uint8_t> rom;
-  std::string invalid = readRom(romFd, system, rom);
-  if (invalid.empty()) invalid = validateRom(rom, system);
-  if (!invalid.empty()) return env->NewStringUTF(invalid.c_str());
+  std::string romPath;
+  if (system == System::N3ds) {
+    // 3DS games run to gigabytes, so the core reads the file itself, through a descriptor of our
+    // own that stays open while it runs.
+    const std::string invalid = checkN3dsImage(romFd);
+    if (!invalid.empty()) return env->NewStringUTF(invalid.c_str());
+    const int fd = fcntl(romFd, F_DUPFD_CLOEXEC, 0);
+    if (fd < 0) return env->NewStringUTF("Could not read this file.");
+    stopEmulator();
+    gRomFd = fd;
+    // Only the VFS (see vfsOpen) ever opens this path. The extension tells Azahar's loader the
+    // type when the contents alone don't, as for CIA files.
+    romPath = "/proc/self/fd/" + std::to_string(fd) + ".3ds";
+    gRomPath = romPath;
+  } else {
+    std::string invalid = readRom(romFd, system, rom);
+    if (invalid.empty()) invalid = validateRom(rom, system);
+    if (!invalid.empty()) return env->NewStringUTF(invalid.c_str());
+    stopEmulator();
+  }
 
-  stopEmulator();
   gCore = core;
   gSystem = system;
   gSkipBios = system == System::Gba && !gbaHeaderIsValid(rom);
@@ -1136,13 +1956,17 @@ Java_expo_modules_krsemulator_KrsEmulatorNative_start(JNIEnv *env, jobject, jint
   gSavePath = toString(env, savePath);
   gSaveDir = toString(env, saveDir);
   gSystemDir = toString(env, systemDir);
+  gCoreLogFile.store(std::fopen((gSaveDir + "/core.log").c_str(), "w"));
   gPaused.store(false);
   gBackgrounded.store(false);
-  gFastForward.store(false);
+  // The on-screen fast-forward toggle isn't reset here: the controls view owns it, and a tap made
+  // while a large ROM was still loading would otherwise be dropped with the button left lit.
   gPadFastForward.store(false);
   gButtons.store(0);
   gPadButtons.store(0);
   gPointer.store(0);
+  gPadAnalog.store(0);
+  gTouchStick.store(0);
   gUnderruns.store(0);
   gOverruns.store(0);
   gSaveWrites.store(0);
@@ -1157,11 +1981,14 @@ Java_expo_modules_krsemulator_KrsEmulatorNative_start(JNIEnv *env, jobject, jint
   std::promise<std::string> promise;
   std::future<std::string> future = promise.get_future();
   gRunning.store(true);
-  gEmuThread = std::thread(emulatorMain, std::move(rom), std::move(promise));
+  gEmuThread =
+      std::thread(emulatorMain, std::move(rom), std::move(romPath), std::move(promise));
 
   const std::string error = future.get();
   if (error.empty()) return nullptr;
   gEmuThread.join();
+  closeRomFd();
+  closeCoreLog();
   return env->NewStringUTF(error.c_str());
 }
 
@@ -1181,15 +2008,16 @@ Java_expo_modules_krsemulator_KrsEmulatorNative_setButtons(JNIEnv *, jobject, ji
   gButtons.store(static_cast<uint32_t>(buttons), std::memory_order_relaxed);
 }
 
-// A touch on the DS touchscreen, as fractions of its width and height from its top left. Touches
+// A touch on the touchscreen, as fractions of its width and height from its top left. Touches
 // outside it count as lifting the stylus.
 extern "C" JNIEXPORT void JNICALL
 Java_expo_modules_krsemulator_KrsEmulatorNative_setPointer(JNIEnv *, jobject, jboolean pressed,
                                                            jfloat x, jfloat y) {
-  const float u = x;
   // The core stacks the screens with the touchscreen in the bottom half and reads the pointer
   // across the whole frame.
-  const float v = 0.5f + y * 0.5f;
+  const SourceRect touchscreen = screenSource(gSystem, 1);
+  const float u = touchscreen.left + x * (touchscreen.right - touchscreen.left);
+  const float v = touchscreen.top + y * (touchscreen.bottom - touchscreen.top);
   const uint64_t previous = gPointer.load(std::memory_order_relaxed);
   if (pressed != JNI_TRUE || u < 0 || u > 1 || y < 0 || y > 1) {
     // Keep the last position: some games read it again on the frame the stylus lifts.
@@ -1216,6 +2044,33 @@ Java_expo_modules_krsemulator_KrsEmulatorNative_setPadButtons(JNIEnv *, jobject,
   gPadButtons.store(static_cast<uint32_t>(buttons), std::memory_order_relaxed);
 }
 
+// The on-screen Circle Pad, each axis from -1 to 1 with up and left negative.
+extern "C" JNIEXPORT void JNICALL
+Java_expo_modules_krsemulator_KrsEmulatorNative_setTouchStick(JNIEnv *, jobject, jfloat x,
+                                                              jfloat y) {
+  const auto toAxis = [](float value) {
+    if (!std::isfinite(value)) return uint32_t{0};
+    const auto axis = static_cast<int16_t>(std::lround(std::clamp(value, -1.0f, 1.0f) * 0x7FFF));
+    return static_cast<uint32_t>(static_cast<uint16_t>(axis));
+  };
+  gTouchStick.store(toAxis(x) | (toAxis(y) << 16), std::memory_order_relaxed);
+}
+
+// A controller's sticks, each axis from -1 to 1 with up and left negative.
+extern "C" JNIEXPORT void JNICALL
+Java_expo_modules_krsemulator_KrsEmulatorNative_setPadAnalog(JNIEnv *, jobject, jfloat leftX,
+                                                             jfloat leftY, jfloat rightX,
+                                                             jfloat rightY) {
+  const auto toAxis = [](float value) {
+    if (!std::isfinite(value)) return uint64_t{0};
+    const auto axis = static_cast<int16_t>(std::lround(std::clamp(value, -1.0f, 1.0f) * 0x7FFF));
+    return static_cast<uint64_t>(static_cast<uint16_t>(axis));
+  };
+  gPadAnalog.store(toAxis(leftX) | (toAxis(leftY) << 16) | (toAxis(rightX) << 32) |
+                       (toAxis(rightY) << 48),
+                   std::memory_order_relaxed);
+}
+
 extern "C" JNIEXPORT void JNICALL
 Java_expo_modules_krsemulator_KrsEmulatorNative_setVideoSettings(JNIEnv *, jobject, jint filter,
                                                                  jfloat strength, jint aspect,
@@ -1226,7 +2081,7 @@ Java_expo_modules_krsemulator_KrsEmulatorNative_setVideoSettings(JNIEnv *, jobje
   gVideoScaling.store(scaling);
   // The game may be paused, so the picture has to be redrawn for the change to show.
   runOnEmulatorThread([] {
-    if (gRenderer.ready()) gRenderer.draw(gLastFrame);
+    redraw();
     return true;
   });
 }
@@ -1256,9 +2111,7 @@ Java_expo_modules_krsemulator_KrsEmulatorNative_setScreenRects(JNIEnv *env, jobj
   // paused game wouldn't otherwise show the new arrangement.
   {
     std::lock_guard<std::mutex> lock(gCommandMutex);
-    gCommands.emplace_back([] {
-      if (gRenderer.ready()) gRenderer.draw(gLastFrame);
-    });
+    gCommands.emplace_back([] { redraw(); });
   }
   gStateChanged.notify_all();
 }
@@ -1271,6 +2124,11 @@ Java_expo_modules_krsemulator_KrsEmulatorNative_getLastFrame(JNIEnv *env, jobjec
   auto frame = std::make_shared<std::vector<uint8_t>>();
   auto dimensions = std::make_shared<std::pair<int, int>>();
   const bool copied = runOnEmulatorThread([frame, dimensions] {
+    if (gHwRendering) {
+      if (!gRenderer.readHardware(gHwFrameWidth, gHwFrameHeight, *frame)) return false;
+      *dimensions = {gHwFrameWidth, gHwFrameHeight};
+      return true;
+    }
     if (gLastFrame.empty()) return false;
     *frame = toRgba(gLastFrame);
     *dimensions = {gLastFrame.width, gLastFrame.height};
@@ -1328,7 +2186,8 @@ Java_expo_modules_krsemulator_KrsEmulatorNative_setBackgrounded(JNIEnv *, jobjec
 extern "C" JNIEXPORT void JNICALL
 Java_expo_modules_krsemulator_KrsEmulatorNative_setFastForwardSpeed(JNIEnv *, jobject,
                                                                     jdouble speed) {
-  gFastForwardSpeed.store(speed);
+  if (!std::isfinite(speed)) return;
+  gFastForwardSpeed.store(std::clamp(speed, kMinFastForwardSpeed, kMaxFastForwardSpeed));
 }
 
 extern "C" JNIEXPORT jboolean JNICALL

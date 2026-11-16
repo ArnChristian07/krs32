@@ -3,7 +3,7 @@ import type { ComponentType } from 'react';
 import type { ViewProps } from 'react-native';
 
 /** Matches GameSystem in lib/systems.ts. */
-export type EmulatorSystem = 'gba' | 'nds';
+export type EmulatorSystem = 'gba' | 'nds' | '3ds';
 
 export type CoreInfo = {
   name: string;
@@ -25,7 +25,7 @@ export type EmulatorStats = {
 export type ControlDefault = {
   id: string;
   label: string;
-  kind: 'rect' | 'pill' | 'round' | 'cross';
+  kind: 'rect' | 'pill' | 'round' | 'cross' | 'stick';
   x: number;
   y: number;
   size: number;
@@ -53,7 +53,7 @@ declare class KrsEmulatorNativeModule extends NativeModule<KrsEmulatorEvents> {
   getCoreInfo(system?: EmulatorSystem): CoreInfo;
   loadGame(uri: string, system: EmulatorSystem): Promise<{ saveExists: boolean; saveId: string }>;
   /** The name, without extension, of this ROM's save file. */
-  getSaveId(uri: string): Promise<string>;
+  getSaveId(uri: string, system: EmulatorSystem): Promise<string>;
   /** The player's default control positions, sizes and game area for each orientation. */
   getControlDefaults(system?: EmulatorSystem): ControlDefaults;
   /** Connected game controllers; battery is a percentage, or null when the pad doesn't report it. */

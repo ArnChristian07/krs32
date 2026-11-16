@@ -151,7 +151,7 @@ function CheatsScreen({ game, inGame }: { game: Game; inGame: boolean }) {
   useFocusEffect(
     useCallback(() => {
       let active = true;
-      getRomSaveId(game.uri)
+      getRomSaveId(game.uri, game.system)
         .then((id) => {
           if (!active) return;
           const list = loadCheats(id);
@@ -165,7 +165,7 @@ function CheatsScreen({ game, inGame }: { game: Game; inGame: boolean }) {
       return () => {
         active = false;
       };
-    }, [game.uri, applyToGame])
+    }, [game.uri, game.system, applyToGame])
   );
 
   function update(next: Cheat[]) {

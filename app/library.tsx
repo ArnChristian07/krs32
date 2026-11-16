@@ -7,10 +7,21 @@ import Search from 'lucide-react-native/icons/search';
 import SlidersHorizontal from 'lucide-react-native/icons/sliders-horizontal';
 import Star from 'lucide-react-native/icons/star';
 import X from 'lucide-react-native/icons/x';
-import { type ComponentType, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  type ComponentType,
+  memo,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
 import {
   FlatList,
   Keyboard,
+  type ListRenderItem,
+  type NativeScrollEvent,
+  type NativeSyntheticEvent,
   Pressable,
   ScrollView,
   Text,
@@ -18,7 +29,7 @@ import {
   useWindowDimensions,
   View,
 } from 'react-native';
-import { SafeAreaView } from 'react-native-safe-area-context';
+import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { GameCover } from '@/components/GameCover';
 import { GameGridCard } from '@/components/GameGridCard';
@@ -28,6 +39,7 @@ import { LibraryEmptyState } from '@/components/LibraryEmptyState';
 import { ScanningView } from '@/components/ScanningView';
 import { SegmentedControl } from '@/components/SegmentedControl';
 import { SortMenu } from '@/components/SortMenu';
+import { useLatest } from '@/components/useLatest';
 import { palette } from '@/constants/palette';
 import {
   deleteRom,
@@ -58,7 +70,7 @@ import {
   importDsSystemFiles,
   loadSettings,
 } from '@/lib/setup';
-import { type GameSystem, SYSTEMS } from '@/lib/systems';
+import { type GameSystem, SYSTEM_KEYS, SYSTEMS } from '@/lib/systems';
 
 const SIDE_PADDING = 24;
 const COLUMN_GAP = 12;
@@ -67,6 +79,9 @@ const RECENT_LIMIT = 8;
 // Below this width the filter and view controls no longer fit on one row with full labels.
 const COMPACT_WIDTH = 400;
 const SORT_MENU_GAP = 8;
+// How far the list scrolls before the toolbar gets an edge to separate it from the covers.
+const TOOLBAR_EDGE_OFFSET = 4;
+const LIST_BOTTOM_PADDING = 24;
 const NO_GAMES_BODY =
   "KRS-32 plays the ROM files you own. Pick the folder that holds them and we'll build your library.";
 
@@ -274,14 +289,14 @@ function RecentCard({
   );
 }
 
-function GameListRow({
+const GameListRow = memo(function GameListRow({
   game,
   onPress,
   onToggleFavorite,
 }: {
   game: Game;
-  onPress: () => void;
-  onToggleFavorite: () => void;
+  onPress: (game: Game) => void;
+  onToggleFavorite: (game: Game) => void;
 }) {
   const detail = game.playSeconds
     ? formatPlayTime(game.playSeconds)
@@ -295,8 +310,8 @@ function GameListRow({
         accessibilityRole="button"
         accessibilityLabel={game.title}
         accessibilityHint={favoriteHint(game)}
-        onPress={onPress}
-        onLongPress={onToggleFavorite}
+        onPress={() => onPress(game)}
+        onLongPress={() => onToggleFavorite(game)}
         className="flex-1 flex-row items-center gap-3 active:opacity-70">
         <GameCover game={game} width={48} height={64} />
         <View className="flex-1 gap-1">
@@ -317,7 +332,7 @@ function GameListRow({
           game.favorite ? `Remove ${game.title} from favorites` : `Add ${game.title} to favorites`
         }
         accessibilityState={{ selected: !!game.favorite }}
-        onPress={onToggleFavorite}
+        onPress={() => onToggleFavorite(game)}
         className="h-12 w-12 items-center justify-center rounded-[14px] active:bg-control-pressed">
         <Star
           size={20}
@@ -327,10 +342,12 @@ function GameListRow({
       </Pressable>
     </View>
   );
-}
+});
 
 export default function LibraryScreen() {
   const { width: screenWidth } = useWindowDimensions();
+  const insets = useSafeAreaInsets();
+  const [scrolled, setScrolled] = useState(false);
   const [status, setStatus] = useState<Status>('scanning');
   const [roms, setRoms] = useState<Rom[]>([]);
   const [meta, setMeta] = useState(loadGameMeta);
@@ -393,12 +410,13 @@ export default function LibraryScreen() {
   );
   const selectedGame = games.find((game) => game.id === selectedGameId);
   const systemCounts = useMemo(() => {
-    const counts: Record<GameSystem, number> = { gba: 0, nds: 0 };
+    const counts: Record<GameSystem, number> = { gba: 0, nds: 0, '3ds': 0 };
     games.forEach((game) => counts[game.system]++);
     return counts;
   }, [games]);
-  // Only a library with games from both systems needs the system filter.
-  const mixedLibrary = systemCounts.gba > 0 && systemCounts.nds > 0;
+  // Only a library with games from more than one system needs the system filter.
+  const presentSystems = SYSTEM_KEYS.filter((system) => systemCounts[system] > 0);
+  const mixedLibrary = presentSystems.length > 1;
   const activeSystem: SystemFilter = mixedLibrary ? systemFilter : 'all';
   const systemGames = useMemo(
     () => (activeSystem === 'all' ? games : games.filter((game) => game.system === activeSystem)),
@@ -433,11 +451,45 @@ export default function LibraryScreen() {
 
   const cardWidth = (screenWidth - SIDE_PADDING * 2 - COLUMN_GAP * (COLUMNS - 1)) / COLUMNS;
 
-  function toggleFavorite(game: Game) {
-    const next = { ...meta, [game.id]: { ...meta[game.id], favorite: !game.favorite } };
-    setMeta(next);
-    saveGameMeta(next).catch(() => setMeta(loadGameMeta()));
+  // Read through a ref so the handler stays the same and memoized cards don't re-render for it.
+  const latestMeta = useLatest(meta);
+  const toggleFavorite = useCallback(
+    (game: Game) => {
+      const current = latestMeta.get();
+      const next = { ...current, [game.id]: { ...current[game.id], favorite: !game.favorite } };
+      latestMeta.set(next);
+      setMeta(next);
+      saveGameMeta(next).catch(() => setMeta(loadGameMeta()));
+    },
+    [latestMeta]
+  );
+  // A new layout starts a fresh list at the top, which sends no scroll event.
+  function changeLayout(next: Layout) {
+    setLayout(next);
+    setScrolled(false);
   }
+  const selectGame = useCallback((game: Game) => setSelectedGameId(game.id), []);
+
+  // Only crossing the threshold re-renders, not every scroll event.
+  const onListScroll = useCallback((event: NativeSyntheticEvent<NativeScrollEvent>) => {
+    const next = event.nativeEvent.contentOffset.y > TOOLBAR_EDGE_OFFSET;
+    setScrolled((current) => (current === next ? current : next));
+  }, []);
+
+  const renderItem = useCallback<ListRenderItem<Game>>(
+    ({ item }) =>
+      layout === 'grid' ? (
+        <GameGridCard
+          game={item}
+          width={cardWidth}
+          onPress={selectGame}
+          onLongPress={toggleFavorite}
+        />
+      ) : (
+        <GameListRow game={item} onPress={selectGame} onToggleFavorite={toggleFavorite} />
+      ),
+    [layout, cardWidth, selectGame, toggleFavorite]
+  );
 
   function rescan() {
     setScanProgress(EMPTY_SCAN);
@@ -507,7 +559,7 @@ export default function LibraryScreen() {
   // Lives outside the list so the search field and sort menu stay put while scrolling.
   const toolbar = (
     <View
-      className="gap-3 px-6"
+      className={`gap-3 border-b px-6 pb-3 ${scrolled ? 'border-card-border' : 'border-transparent'}`}
       onLayout={(event) => setToolbarHeight(event.nativeEvent.layout.height)}>
       <View
         className={`h-12 flex-row items-center gap-2.5 rounded-[14px] border bg-card px-4 ${
@@ -544,8 +596,10 @@ export default function LibraryScreen() {
         <SegmentedControl<SystemFilter>
           options={[
             { value: 'all', label: `All  ${games.length}` },
-            { value: 'gba', label: `${SYSTEMS.gba.label}  ${systemCounts.gba}` },
-            { value: 'nds', label: `${SYSTEMS.nds.label}  ${systemCounts.nds}` },
+            ...presentSystems.map((system) => ({
+              value: system,
+              label: `${SYSTEMS[system].label}  ${systemCounts[system]}`,
+            })),
           ]}
           value={activeSystem}
           onChange={setSystemFilter}
@@ -584,13 +638,13 @@ export default function LibraryScreen() {
             icon={LayoutGrid}
             label="Grid view"
             selected={layout === 'grid'}
-            onPress={() => setLayout('grid')}
+            onPress={() => changeLayout('grid')}
           />
           <LayoutOption
             icon={List}
             label="List view"
             selected={layout === 'list'}
-            onPress={() => setLayout('list')}
+            onPress={() => changeLayout('list')}
           />
         </View>
       </View>
@@ -604,11 +658,11 @@ export default function LibraryScreen() {
     dsFilesFound.length < DS_SYSTEM_FILES.length;
 
   const listHeader = search ? (
-    <Text className="px-6 pb-3 pt-4 font-mono text-[12px] text-secondary" numberOfLines={1}>
+    <Text className="px-6 pb-3 pt-1 font-mono text-[12px] text-secondary" numberOfLines={1}>
       {visibleGames.length} {visibleGames.length === 1 ? 'result' : 'results'} for “{search}”
     </Text>
   ) : (
-    <View className="gap-5 pb-4 pt-5">
+    <View className="gap-5 pb-4 pt-2">
       {showFirmwareBanner && (
         <DsFirmwareBanner onImported={() => setDsFilesFound(dsSystemFilesFound())} />
       )}
@@ -709,24 +763,18 @@ export default function LibraryScreen() {
           }
           ListHeaderComponent={listHeader}
           ListEmptyComponent={emptyList}
+          // Keeps the last row clear of the gesture bar instead of ending flush against it.
+          contentContainerStyle={{ paddingBottom: insets.bottom + LIST_BOTTOM_PADDING }}
           keyboardShouldPersistTaps="handled"
+          keyboardDismissMode="on-drag"
           showsVerticalScrollIndicator={false}
-          renderItem={({ item }) =>
-            layout === 'grid' ? (
-              <GameGridCard
-                game={item}
-                width={cardWidth}
-                onPress={() => setSelectedGameId(item.id)}
-                onLongPress={() => toggleFavorite(item)}
-              />
-            ) : (
-              <GameListRow
-                game={item}
-                onPress={() => setSelectedGameId(item.id)}
-                onToggleFavorite={() => toggleFavorite(item)}
-              />
-            )
-          }
+          onScroll={onListScroll}
+          scrollEventThrottle={32}
+          initialNumToRender={layout === 'grid' ? COLUMNS * 4 : 12}
+          maxToRenderPerBatch={layout === 'grid' ? COLUMNS * 3 : 10}
+          windowSize={7}
+          removeClippedSubviews
+          renderItem={renderItem}
         />
         {sortMenuOpen && (
           <SortMenu

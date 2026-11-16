@@ -47,7 +47,7 @@ import {
   sizeLimits,
   withoutExtra,
 } from '@/lib/controlLayout';
-import type { GameSystem } from '@/lib/systems';
+import { type GameSystem, SYSTEMS } from '@/lib/systems';
 import { getPlayRequest } from '@/lib/library';
 import { getRomSaveId, PREVIEW_THUMBNAIL, readPreviewUri } from '@/lib/saveStates';
 import KrsEmulator, { type ControlDefault, type OrientationDefaults } from '@/modules/krs-emulator';
@@ -61,10 +61,11 @@ const LANDSCAPE_PANEL_TOP = 68;
 // New buttons appear on whichever side of the floating panel has room, so it can't hide them.
 const LANDSCAPE_SPAWN_Y_BELOW_PANEL = 336;
 const LANDSCAPE_SPAWN_Y_ABOVE_PANEL = 80;
-// The game picture each system produces; the DS's is its two screens stacked.
+// The game picture each system produces; the DS's and 3DS's are their two screens stacked.
 const PICTURE_SIZE: Record<GameSystem, { width: number; height: number }> = {
   gba: { width: 240, height: 160 },
   nds: { width: 256, height: 384 },
+  '3ds': { width: 400, height: 480 },
 };
 const MIN_OPACITY = 0.2;
 const OPACITY_STEP = 0.05;
@@ -234,7 +235,7 @@ function EditableControl({
   });
 
   const radius =
-    control.kind === 'round' || control.kind === 'pill'
+    control.kind === 'round' || control.kind === 'pill' || control.kind === 'stick'
       ? height / 2
       : control.kind === 'rect'
         ? 14 * canvas.scale
@@ -443,8 +444,9 @@ function ResetButton({ onPress }: { onPress: () => void }) {
 
 export default function ControlEditorScreen() {
   const params = useLocalSearchParams<{ orientation?: string; system?: string }>();
-  // Opened from Settings there's no game, so it edits the GBA layout.
-  const system: GameSystem = params.system === 'nds' ? 'nds' : 'gba';
+  // Settings opens it for a chosen system; with no system given it edits the GBA layout.
+  const system: GameSystem =
+    params.system === 'nds' || params.system === '3ds' ? params.system : 'gba';
   const picture = PICTURE_SIZE[system];
   const { width, height } = useWindowDimensions();
   const insets = useSafeAreaInsets();
@@ -484,10 +486,11 @@ export default function ControlEditorScreen() {
 
   useEffect(() => {
     const game = getPlayRequest()?.game;
-    if (!game) return;
+    // From Settings the last game may be another system's, whose picture wouldn't fit.
+    if (!game || game.system !== system) return;
     let active = true;
     (async () => {
-      const saveId = await getRomSaveId(game.uri);
+      const saveId = await getRomSaveId(game.uri, game.system);
       await KrsEmulator.captureThumbnail(PREVIEW_THUMBNAIL);
       if (active) setPreviewUri(readPreviewUri(saveId));
     })().catch(() => {
@@ -496,7 +499,7 @@ export default function ControlEditorScreen() {
     return () => {
       active = false;
     };
-  }, []);
+  }, [system]);
 
   const current: OrientationLayout = layout[orientation];
   const orientationDefaults = defaults[orientation];
@@ -859,7 +862,7 @@ export default function ControlEditorScreen() {
         <Text
           className="flex-1 font-inter-bold text-[20px] leading-[26px] text-foreground"
           accessibilityRole="header">
-          Edit controls
+          Edit {SYSTEMS[system].label} controls
         </Text>
         <IconAction label="Undo" disabled={history.length === 0} onPress={undo}>
           <Undo2 size={22} color={palette.secondary} />

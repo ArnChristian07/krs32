@@ -1,3 +1,4 @@
+import { memo } from 'react';
 import { Pressable, Text } from 'react-native';
 
 import { GameCover } from '@/components/GameCover';
@@ -9,11 +10,13 @@ type GameGridCardProps = {
   game: Game;
   width: number;
   showLastPlayed?: boolean;
-  onPress?: () => void;
-  onLongPress?: () => void;
+  onPress?: (game: Game) => void;
+  onLongPress?: (game: Game) => void;
 };
 
-export function GameGridCard({
+// Memoized so scrolling the library only renders cards that come into view, not every card each
+// time the list re-renders.
+export const GameGridCard = memo(function GameGridCard({
   game,
   width,
   showLastPlayed = true,
@@ -30,8 +33,8 @@ export function GameGridCard({
       accessibilityLabel={game.title}
       accessibilityHint={onLongPress ? hint : undefined}
       disabled={!onPress && !onLongPress}
-      onPress={onPress}
-      onLongPress={onLongPress}
+      onPress={onPress && (() => onPress(game))}
+      onLongPress={onLongPress && (() => onLongPress(game))}
       style={{ width }}
       className="mb-5 active:opacity-70">
       <GameCover game={game} width={width} height={width * COVER_RATIO} showDetails />
@@ -45,4 +48,4 @@ export function GameGridCard({
       )}
     </Pressable>
   );
-}
+});

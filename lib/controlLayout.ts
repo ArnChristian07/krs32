@@ -125,17 +125,24 @@ const EMPTY_DS_LAYOUT: ControlLayout = {
   landscape: { opacity: 0.7, controls: {} },
 };
 
+// The 3DS starts like the DS, its X and Y in the same spots.
 export const emptyLayout = (system: GameSystem = 'gba') =>
-  system === 'nds' ? EMPTY_DS_LAYOUT : EMPTY_LAYOUT;
+  system === 'gba' ? EMPTY_LAYOUT : EMPTY_DS_LAYOUT;
+
+// Where each system's layout is kept in the settings.
+const LAYOUT_SETTING = {
+  gba: 'controlLayout',
+  nds: 'dsControlLayout',
+  '3ds': 'n3dsControlLayout',
+} as const satisfies Record<GameSystem, string>;
 
 /** Each system keeps its own layout, since their controls and default places differ. */
 export function loadControlLayout(system: GameSystem = 'gba'): ControlLayout {
-  const settings = loadSettings();
-  return (system === 'nds' ? settings.dsControlLayout : settings.controlLayout) ?? emptyLayout(system);
+  return loadSettings()[LAYOUT_SETTING[system]] ?? emptyLayout(system);
 }
 
 export const saveControlLayout = (controlLayout: ControlLayout, system: GameSystem = 'gba') =>
-  saveSettings(system === 'nds' ? { dsControlLayout: controlLayout } : { controlLayout });
+  saveSettings({ [LAYOUT_SETTING[system]]: controlLayout });
 
 export function placedControl(control: ControlDefault, layout: OrientationLayout): PlacedControl {
   return (

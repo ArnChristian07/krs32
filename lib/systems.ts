@@ -1,5 +1,5 @@
 /** The systems the player can run. Each has its own emulator core. */
-export type GameSystem = 'gba' | 'nds';
+export type GameSystem = 'gba' | 'nds' | '3ds';
 
 type SystemInfo = {
   /** Short name for labels, such as on a game card. */
@@ -8,12 +8,27 @@ type SystemInfo = {
   extensions: string[];
   /** TheGamesDB's platform id, for cover search. */
   theGamesDbPlatform: string;
+  /** A second, touch-sensitive screen below the main one. */
+  twoScreens: boolean;
+  /** Whether its core takes cheat codes. */
+  cheats: boolean;
 };
 
 export const SYSTEMS: Record<GameSystem, SystemInfo> = {
-  gba: { label: 'GBA', extensions: ['.gba'], theGamesDbPlatform: '5' },
-  nds: { label: 'DS', extensions: ['.nds'], theGamesDbPlatform: '8' },
+  gba: { label: 'GBA', extensions: ['.gba'], theGamesDbPlatform: '5', twoScreens: false, cheats: true },
+  nds: { label: 'DS', extensions: ['.nds'], theGamesDbPlatform: '8', twoScreens: true, cheats: true },
+  // Decrypted dumps only: the core can't run encrypted games.
+  '3ds': {
+    label: '3DS',
+    extensions: ['.3ds', '.cci', '.cxi', '.3dsx'],
+    theGamesDbPlatform: '4912',
+    twoScreens: true,
+    cheats: false,
+  },
 };
+
+/** Every system, in the order they're listed in filters. */
+export const SYSTEM_KEYS = Object.keys(SYSTEMS) as GameSystem[];
 
 const ALL_EXTENSIONS = Object.values(SYSTEMS).flatMap((system) => system.extensions);
 

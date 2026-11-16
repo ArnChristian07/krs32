@@ -46,17 +46,21 @@ export function GameCover({ game, width, height, showDetails = false }: GameCove
           {showDetails && <Text className="font-mono text-[11px] text-muted">no cover</Text>}
         </>
       )}
-      {/* GBA is the default, so only DS games are marked. */}
-      {showDetails && game.system === 'nds' && (
+      {showDetails && (
         <View
-          accessibilityLabel={`${SYSTEMS.nds.label} game`}
+          accessibilityLabel={`${SYSTEMS[game.system].label} game`}
           className="absolute bottom-2 left-2 flex-row items-center gap-1.5 rounded-md bg-background/90 px-1.5 py-1">
-          <View className="gap-[2px]">
-            <View className="h-[4px] w-[7px] rounded-[1px] bg-accent" />
-            <View className="h-[4px] w-[7px] rounded-[1px] border border-accent" />
-          </View>
+          {/* A glyph of the console's screens: the DS's and 3DS's two stacked, the GBA's one wide. */}
+          {SYSTEMS[game.system].twoScreens ? (
+            <View className="gap-[2px]">
+              <View className="h-[4px] w-[7px] rounded-[1px] bg-accent" />
+              <View className="h-[4px] w-[7px] rounded-[1px] border border-accent" />
+            </View>
+          ) : (
+            <View className="h-[7px] w-[10px] rounded-[1px] bg-accent" />
+          )}
           <Text className="font-mono-medium text-[10px] tracking-[1px] text-foreground">
-            {SYSTEMS.nds.label}
+            {SYSTEMS[game.system].label}
           </Text>
         </View>
       )}

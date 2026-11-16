@@ -25,6 +25,7 @@ import {
   loadSettings,
   saveSettings,
 } from '@/lib/setup';
+import { SYSTEM_KEYS, SYSTEMS } from '@/lib/systems';
 import { filterLabel } from '@/lib/video';
 import KrsEmulator from '@/modules/krs-emulator';
 
@@ -155,7 +156,7 @@ export default function SettingsScreen() {
 
   const missingDsFiles = DS_SYSTEM_FILES.filter((name) => !dsFilesFound.includes(name));
   const { video, romFolderUri } = settings;
-  const portraitOpacity = Math.round(loadControlLayout().portrait.opacity * 100);
+  const percent = (opacity: number) => `${Math.round(opacity * 100)}%`;
   const totalStorage = storage ? storage.roms + storage.saves + storage.cache : 0;
   const scalingLabel = video.scaling === 'integer' ? 'integer scaling' : 'fit to screen';
   const storageShare = (bytes: number) => (totalStorage > 0 ? bytes / totalStorage : 0);
@@ -191,9 +192,24 @@ export default function SettingsScreen() {
         </SettingsGroup>
 
         <SettingsGroup>
-          <SettingsRow title="Controls" onPress={() => router.push('/control-editor')}>
-            <Detail>Edit layouts · opacity {portraitOpacity}%</Detail>
-          </SettingsRow>
+          {SYSTEM_KEYS.map((system) => {
+            const { portrait, landscape } = loadControlLayout(system);
+            const title = `${SYSTEMS[system].label} controls`;
+            return (
+              <SettingsRow
+                key={system}
+                title={title}
+                accessibilityLabel={`${title}. Edit layout`}
+                onPress={() =>
+                  router.push({ pathname: '/control-editor', params: { system } })
+                }>
+                <Detail>
+                  Opacity {percent(portrait.opacity)} portrait · {percent(landscape.opacity)}{' '}
+                  landscape
+                </Detail>
+              </SettingsRow>
+            );
+          })}
           <SettingsRow
             title="Bluetooth controller mapping"
             onPress={() => router.push('/controller-mapping')}>
@@ -213,7 +229,7 @@ export default function SettingsScreen() {
               <Text className="font-inter-semibold text-[16px] text-foreground">
                 Hide touch controls with a controller
               </Text>
-              <Detail>DS games give the screens the whole display</Detail>
+              <Detail>DS and 3DS games give the screens the whole display</Detail>
             </View>
             <Toggle
               label="Hide touch controls with a controller"

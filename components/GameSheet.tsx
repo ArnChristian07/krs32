@@ -30,6 +30,7 @@ import {
 import { loadCheats } from '@/lib/cheats';
 import { chooseCover, downloadCover, hasCoverSearch, removeCover } from '@/lib/covers';
 import { countUsedSlots, getRomSaveId, SLOT_COUNT } from '@/lib/saveStates';
+import { SYSTEMS } from '@/lib/systems';
 
 function Stat({ label, value }: { label: string; value: string }) {
   return (
@@ -116,7 +117,7 @@ export function GameSheet({
 
   useEffect(() => {
     let active = true;
-    getRomSaveId(game.uri)
+    getRomSaveId(game.uri, game.system)
       .then((saveId) => {
         if (!active) return;
         setUsedSlots(countUsedSlots(saveId));
@@ -127,7 +128,7 @@ export function GameSheet({
     return () => {
       active = false;
     };
-  }, [game.uri]);
+  }, [game.uri, game.system]);
 
   const autoSaveAt = game.lastAutoSaveAt;
 
@@ -253,7 +254,9 @@ export function GameSheet({
                 value={`${usedSlots} / ${SLOT_COUNT}`}
                 onPress={onOpenSaveStates}
               />
-              <ActionRow label="Cheats" value={`${cheatsOn} on`} onPress={onOpenCheats} />
+              {SYSTEMS[game.system].cheats && (
+                <ActionRow label="Cheats" value={`${cheatsOn} on`} onPress={onOpenCheats} />
+              )}
               <ActionRow
                 label={game.coverFile ? 'Change cover image' : 'Add cover image'}
                 onPress={() => updateCover(() => chooseCover(game.id))}

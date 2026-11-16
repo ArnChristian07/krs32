@@ -174,7 +174,7 @@ export async function scanRoms(
 /** Deletes the ROM file and, if asked, its in-game save. */
 export async function deleteRom(game: Game, alsoDeleteSave: boolean) {
   // Saves are named after the ROM's contents, so the name must be worked out before it's gone.
-  const saveId = alsoDeleteSave ? await KrsEmulator.getSaveId(game.uri) : null;
+  const saveId = alsoDeleteSave ? await KrsEmulator.getSaveId(game.uri, game.system) : null;
   new File(game.uri).delete();
   if (saveId) {
     // Matches the folder and file name used by KrsEmulatorModule.

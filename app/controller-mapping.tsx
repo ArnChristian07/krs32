@@ -70,13 +70,37 @@ function KeyChip({ children }: { children: string }) {
   );
 }
 
+function RowLabel({ label, systems }: { label: string; systems?: string }) {
+  return (
+    <View className="flex-row items-center gap-2">
+      <Text className="font-inter-semibold text-[15px] text-foreground">{label}</Text>
+      {systems && <Text className="font-mono text-[11px] text-secondary">{systems}</Text>}
+    </View>
+  );
+}
+
+/** A control that follows the controller as it is and can't be remapped. */
+function FixedRow({ label, systems, keys }: { label: string; systems?: string; keys: string }) {
+  return (
+    <View
+      accessible
+      accessibilityLabel={`${label}${systems ? `, ${systems}` : ''}, ${keys.toLowerCase()}`}
+      className="h-12 flex-row items-center justify-between px-3.5">
+      <RowLabel label={label} systems={systems} />
+      <KeyChip>{keys}</KeyChip>
+    </View>
+  );
+}
+
 function MappingRow({
   label,
+  systems,
   keys,
   listening,
   onPress,
 }: {
   label: string;
+  systems?: string;
   keys: string[];
   listening: boolean;
   onPress: () => void;
@@ -84,14 +108,14 @@ function MappingRow({
   return (
     <Pressable
       accessibilityRole="button"
-      accessibilityLabel={`${label}, ${
+      accessibilityLabel={`${label}${systems ? `, ${systems} only` : ''}, ${
         listening ? 'press a button' : keys.length > 0 ? formatKeys(keys) : 'not set'
       }`}
       onPress={onPress}
       className={`h-12 flex-row items-center justify-between border-card-border px-3.5 ${
         listening ? 'border border-accent bg-accent/15' : 'active:bg-control-pressed'
       }`}>
-      <Text className="font-inter-semibold text-[15px] text-foreground">{label}</Text>
+      <RowLabel label={label} systems={systems} />
       {listening ? (
         <View className="flex-row items-center gap-2">
           <ListeningDot />
@@ -208,38 +232,47 @@ export default function ControllerMappingScreen() {
           <Text className="font-inter text-[12px] text-secondary">Tap a row, then press</Text>
         </View>
         <View className="overflow-hidden rounded-2xl border border-card-border bg-card">
-          {BUTTON_ROWS.map(({ action, label }) => (
+          {BUTTON_ROWS.map(({ action, label, systems }) => (
             <MappingRow
               key={action}
               label={label}
+              systems={systems}
               keys={mapping[action]}
               listening={listeningFor === action}
               onPress={() => toggleListening(action)}
             />
           ))}
-          <View
-            accessible
-            accessibilityLabel="D-pad, D-pad and left stick"
-            className="h-12 flex-row items-center justify-between px-3.5">
-            <Text className="font-inter-semibold text-[15px] text-foreground">D-pad</Text>
-            <KeyChip>DPAD + LEFT STICK</KeyChip>
-          </View>
+          <FixedRow label="D-pad" keys="DPAD" />
+        </View>
+
+        <Text className="pt-1 font-mono-medium text-[12px] tracking-[1.4px] text-secondary">
+          STICKS
+        </Text>
+        <View className="overflow-hidden rounded-2xl border border-card-border bg-card">
+          <FixedRow label="D-pad" systems="GBA · DS" keys="LEFT STICK" />
+          <FixedRow label="Circle Pad" systems="3DS" keys="LEFT STICK" />
+          <FixedRow label="C-stick" systems="3DS" keys="RIGHT STICK" />
         </View>
 
         <Text className="pt-1 font-mono-medium text-[12px] tracking-[1.4px] text-secondary">
           SHORTCUTS
         </Text>
         <View className="overflow-hidden rounded-2xl border border-card-border bg-card">
-          {SHORTCUT_ROWS.map(({ action, label }) => (
+          {SHORTCUT_ROWS.map(({ action, label, systems }) => (
             <MappingRow
               key={action}
               label={label}
+              systems={systems}
               keys={mapping[action]}
               listening={listeningFor === action}
               onPress={() => toggleListening(action)}
             />
           ))}
         </View>
+        <Text className="font-inter text-[12px] leading-[17px] text-secondary">
+          ZL, ZR and fast-forward can share a button: 3DS games get ZL and ZR, other games
+          fast-forward.
+        </Text>
 
         {failed && (
           <Text
